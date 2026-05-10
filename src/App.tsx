@@ -243,9 +243,16 @@ export default function App() {
         if (data.type === 'memory') storageMsg = ' (محفوظ في الذاكرة المؤقتة فقط - لن يستمر بعد إعادة التشغيل)';
         setStatus({ type: 'success', message: 'تم حفظ الإعدادات بنجاح' + storageMsg });
         checkAiHealth();
+      } else {
+        const errorData = await res.json().catch(() => ({}));
+        setStatus({ 
+          type: 'error', 
+          message: `فشل حفظ الإعدادات: ${errorData.error || res.statusText || 'خطأ غير معروف'}` 
+        });
       }
-    } catch (e) {
-      setStatus({ type: 'error', message: 'فشل حفظ الإعدادات' });
+    } catch (e: any) {
+      console.error("Update settings error:", e);
+      setStatus({ type: 'error', message: 'فشل الاتصال بالسيرفر لحفظ الإعدادات' });
     } finally {
       setSettingsLoading(false);
     }

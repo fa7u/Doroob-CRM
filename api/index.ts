@@ -18,10 +18,19 @@ const __dirname = path.dirname(__filename);
 
 // Use multiple strategies to find the config file
 const getFirebaseConfig = () => {
+    console.log(`[Firebase] __dirname: ${__dirname}`);
+    console.log(`[Firebase] process.cwd(): ${process.cwd()}`);
+    
+    // Check if we are running in Vercel environment where the file might be in the root of the function
+    const localConfig = path.join(__dirname, 'firebase-applet-config.json');
+    if (fs.existsSync(localConfig)) {
+        console.log(`[Firebase] Found config in local __dirname: ${localConfig}`);
+        return JSON.parse(fs.readFileSync(localConfig, 'utf8'));
+    }
+
     const paths = [
         path.join(process.cwd(), 'firebase-applet-config.json'),
         path.join(__dirname, '../firebase-applet-config.json'),
-        path.join(__dirname, 'firebase-applet-config.json'),
         path.join(process.cwd(), 'api', 'firebase-applet-config.json')
     ];
     for (const p of paths) {
@@ -30,13 +39,18 @@ const getFirebaseConfig = () => {
             return JSON.parse(fs.readFileSync(p, 'utf8'));
         }
     }
-    // Final fallback: check root relative to this file
-    try {
-        const rootPath = path.resolve(__dirname, '..', 'firebase-applet-config.json');
-        if (fs.existsSync(rootPath)) return JSON.parse(fs.readFileSync(rootPath, 'utf8'));
-    } catch (e) {}
+    
+    // Check environment variable as fallback
+    if (process.env.FIREBASE_CONFIG_JSON) {
+        try {
+            console.log(`[Firebase] Using config from FIREBASE_CONFIG_JSON env var`);
+            return JSON.parse(process.env.FIREBASE_CONFIG_JSON);
+        } catch (e) {}
+    }
 
-    throw new Error("firebase-applet-config.json not found. Please ensure the file is in the root directory.");
+    console.error("[Firebase] Config file NOT found in known paths.");
+    // Return empty config to avoid crash, but initialization will likely fail
+    return { projectId: process.env.GOOGLE_CLOUD_PROJECT || "fallback-project" };
 };
 
 const firebaseConfig = getFirebaseConfig();
@@ -79,6 +93,7 @@ const ARCHIVE_COL = "archives";
 
 // Initialize Firestore Admin instance
 let firestore: any;
+let isInitDone = false;
 
 // Memory Fallback for dev environments with storage issues
 const memDb = {
@@ -88,6 +103,7 @@ const memDb = {
 };
 
 async function autoInit() {
+  if (isInitDone) return;
   try {
      const dbId = firebaseConfig.firestoreDatabaseId;
      console.log(`[Firestore Admin] Starting Auto-Init. Config DB: ${dbId || "(default)"}`);
@@ -99,44 +115,51 @@ async function autoInit() {
          // Heartbeat
          await Promise.race([
            db.collection("settings").limit(1).get(),
-           new Promise((_, reject) => setTimeout(() => reject(new Error("Timeout")), 2500))
+           new Promise((_, reject) => setTimeout(() => reject(new Error("Timeout")), 3000))
          ]);
          firestore = db;
-         console.log(`[Firestore Admin] SUCCESS: Heartbeat passed for ${dbId}`);
+         console.log(`[Firestore Admin] SUCCESS: Connected to ${dbId}`);
+         isInitDone = true;
          return;
        } catch (err: any) {
          console.warn(`[Firestore Admin] Heartbeat failed for ${dbId}: ${err.message}`);
-         if (!String(err.message).includes("NOT_FOUND")) {
-            firestore = getFirestore(dbId);
-            return;
-         }
        }
      }
      
-     // 2. Try Default instance if no dbId or if named failed with NOT_FOUND
+     // 2. Try Default instance
      try {
        const db = getFirestore();
        await Promise.race([
          db.collection("settings").limit(1).get(),
-         new Promise((_, reject) => setTimeout(() => reject(new Error("Timeout")), 2500))
+         new Promise((_, reject) => setTimeout(() => reject(new Error("Timeout")), 3000))
        ]);
        firestore = db;
        console.log(`[Firestore Admin] SUCCESS: Connected to Default Database`);
+       isInitDone = true;
        return;
      } catch (err: any) {
        console.warn(`[Firestore Admin] Default Database heartbeat failed: ${err.message}`);
      }
 
-     // Final fallback: Use the configured one if it exists, else default
-     firestore = dbId && dbId !== "(default)" ? getFirestore(dbId) : getFirestore();
+     // Final fallback attempt
+     firestore = getFirestore();
+     isInitDone = true;
   } catch (err: any) {
      console.error("CRITICAL: Firestore initialization error:", err.message);
-     firestore = getFirestore();
+     isInitDone = true;
   }
 }
 
 // Background init
-autoInit().catch(e => console.error("[Background Init Error]", e));
+autoInit().catch(e => {
+    console.error("[Background Init Error]", e);
+    isInitDone = true;
+});
+
+async function ensureDb() {
+    if (!isInitDone) await autoInit();
+    return firestore;
+}
 
 // Helper to check if error is NOT_FOUND or PERMISSION_DENIED
 const isStorageError = (e: any) => {
@@ -173,23 +196,20 @@ const getSettings = async () => {
       gmailUser: getEnv("GMAIL_USER") || getEnv("GMAIL_USERNAME"),
       gmailPass: getEnv("GMAIL_APP_PASSWORD") || getEnv("GMAIL_PASS") || getEnv("GMAIL_PASSWORD"),
       hubspotToken: getEnv("HUBSPOT_ACCESS_TOKEN") || getEnv("HUBSPOT_TOKEN") || getEnv("HUBSPOT_KEY"),
-      publicAppUrl: getEnv("PUBLIC_APP_URL") || getEnv("APP_URL") || getEnv("VERCEL_URL"),
-      geminiApiKey: getEnv("GEMINI_API_KEY") || getEnv("CUSTOM_GEMINI_API_KEY") || getEnv("VITE_GEMINI_API_KEY"),
-      feedbackLink: getEnv("FEEDBACK_LINK") || "https://docs.google.com/forms/d/e/1FAIpQLSf5u5m2p1WvP..."
+      publicAppUrl: getEnv("PUBLIC_APP_URL") || getEnv("APP_URL") || getEnv("VERCEL_URL") || getEnv("VITE_PUBLIC_APP_URL"),
+      geminiApiKey: getEnv("GEMINI_API_KEY") || getEnv("CUSTOM_GEMINI_API_KEY") || getEnv("VITE_GEMINI_API_KEY") || getEnv("GOOGLE_API_KEY"),
+      feedbackLink: getEnv("FEEDBACK_LINK") || "https://docs.google.com/forms/d/e/1FAIpQLSf5u5m2p1WvP-N_u8fCjP_U6u_n_9_X_8_Q_X_7_Q/viewform"
     };
 
     let firestoreData: any = null;
+    const db = await ensureDb();
 
-    if (firestore) {
+    if (db) {
       try {
-        const settingsDoc = await firestore.collection(SETTINGS_COL).doc(GLOBAL_SETTINGS_ID).get();
+        const settingsDoc = await db.collection(SETTINGS_COL).doc(GLOBAL_SETTINGS_ID).get();
         if (settingsDoc.exists) firestoreData = settingsDoc.data();
       } catch (e: any) {
-        if (String(e.message).includes("PERMISSION_DENIED") || String(e.message).includes("7")) {
-           firestore = null; 
-        } else if (String(e.message).includes("NOT_FOUND")) {
-           firestore = null; 
-        }
+        console.error("[Firestore] Admin getSettings failed:", e.message);
       }
     }
 
@@ -214,15 +234,19 @@ const getSettings = async () => {
 
 const saveSettings = async (data: any) => {
     try {
-      if (firestore) {
+      const db = await ensureDb();
+      if (db) {
         try {
-          await firestore.collection(SETTINGS_COL).doc(GLOBAL_SETTINGS_ID).set(data, { merge: true });
+          await db.collection(SETTINGS_COL).doc(GLOBAL_SETTINGS_ID).set(data, { merge: true });
           return { type: 'admin', success: true };
-        } catch (adminErr: any) {}
+        } catch (adminErr: any) {
+          console.error("[Firestore] Admin saveSettings error:", adminErr.message);
+        }
       }
       await clientSetDoc(clientDoc(clientDb, SETTINGS_COL, GLOBAL_SETTINGS_ID), data, { merge: true });
       return { type: 'client', success: true };
     } catch (e: any) {
+      console.error("[Firestore] Save error:", e.message);
       if (isStorageError(e)) {
         try {
           await clientSetDoc(clientDoc(clientDb, SETTINGS_COL, GLOBAL_SETTINGS_ID), data, { merge: true });
@@ -238,8 +262,9 @@ const saveSettings = async (data: any) => {
 
 const getInvitation = async (id: string) => {
     try {
-      if (firestore) {
-        const invDoc = await firestore.collection(INV_COL).doc(id).get();
+      const db = await ensureDb();
+      if (db) {
+        const invDoc = await db.collection(INV_COL).doc(id).get();
         if (invDoc.exists) return invDoc.data();
       }
       const snap = await clientGetDoc(clientDoc(clientDb, INV_COL, id));
@@ -251,8 +276,9 @@ const getInvitation = async (id: string) => {
 
 const saveInvitation = async (id: string, data: any) => {
     try {
-      if (firestore) {
-        await firestore.collection(INV_COL).doc(id).set(data, { merge: true });
+      const db = await ensureDb();
+      if (db) {
+        await db.collection(INV_COL).doc(id).set(data, { merge: true });
         return;
       }
       await clientSetDoc(clientDoc(clientDb, INV_COL, id), data, { merge: true });
@@ -268,8 +294,9 @@ const saveInvitation = async (id: string, data: any) => {
 const deleteInvitation = async (id: string) => {
     try {
       memDb.invitations.delete(id);
-      if (firestore) {
-        try { await firestore.collection(INV_COL).doc(id).delete(); return; } catch (e: any) {}
+      const db = await ensureDb();
+      if (db) {
+        try { await db.collection(INV_COL).doc(id).delete(); return; } catch (e: any) {}
       }
       await clientDeleteDoc(clientDoc(clientDb, INV_COL, id));
     } catch (e: any) {}
@@ -277,9 +304,10 @@ const deleteInvitation = async (id: string) => {
 
 const getAllInvitations = async () => {
     try {
-      if (firestore) {
+      const db = await ensureDb();
+      if (db) {
         try {
-          const snapshot = await firestore.collection(INV_COL).get();
+          const snapshot = await db.collection(INV_COL).get();
           return snapshot.docs.map((d: any) => ({ id: d.id, ...d.data() }));
         } catch (e) { if (!isStorageError(e)) throw e; }
       }
@@ -292,9 +320,10 @@ const getAllInvitations = async () => {
 
 const getAllArchives = async () => {
     try {
-      if (firestore) {
+      const db = await ensureDb();
+      if (db) {
         try {
-          const snapshot = await firestore.collection(ARCHIVE_COL).get();
+          const snapshot = await db.collection(ARCHIVE_COL).get();
           return snapshot.docs.map((d: any) => ({ id: d.id, ...d.data() }));
         } catch (e) { if (!isStorageError(e)) throw e; }
       }
@@ -307,8 +336,9 @@ const getAllArchives = async () => {
 
 const saveArchive = async (id: string, data: any) => {
     try {
-      if (firestore) {
-        try { await firestore.collection(ARCHIVE_COL).doc(id).set(data); return; } catch (e) {}
+      const db = await ensureDb();
+      if (db) {
+        try { await db.collection(ARCHIVE_COL).doc(id).set(data); return; } catch (e) {}
       }
       await clientSetDoc(clientDoc(clientDb, ARCHIVE_COL, id), data);
     } catch (e) { memDb.archives.set(id, data); }
@@ -317,8 +347,9 @@ const saveArchive = async (id: string, data: any) => {
 const deleteArchive = async (id: string) => {
     try {
       memDb.archives.delete(id);
-      if (firestore) {
-        try { await firestore.collection(ARCHIVE_COL).doc(id).delete(); return; } catch (e) {}
+      const db = await ensureDb();
+      if (db) {
+        try { await db.collection(ARCHIVE_COL).doc(id).delete(); return; } catch (e) {}
       }
       await clientDeleteDoc(clientDoc(clientDb, ARCHIVE_COL, id));
     } catch (e) {}
@@ -351,6 +382,7 @@ const getResend = () => {
 
 app.get("/api/debug", async (req, res) => {
   const s = await getSettings();
+  const db = await ensureDb();
   const checkEnv = (key: string) => {
     const val = process.env[key] || process.env[`VITE_${key}`] || process.env[`NEXT_PUBLIC_${key}`] || "";
     if (!val) return "Missing";
@@ -360,13 +392,13 @@ app.get("/api/debug", async (req, res) => {
   res.json({
     environment: process.env.NODE_ENV,
     isVercel: process.env.VERCEL === "1",
-    firestore: firestore ? "Admin SDK Active" : "Client SDK Fallback",
+    firestore: db ? "Admin SDK Active" : "Client SDK Fallback",
     configSource: firebaseConfig.projectId,
     variables: {
-      GMAIL_USER: checkEnv("GMAIL_USER"),
-      GMAIL_PASS: checkEnv("GMAIL_APP_PASSWORD") || checkEnv("GMAIL_PASS"),
+      GMAIL_USER: checkEnv("GMAIL_USER") || checkEnv("GMAIL_USERNAME"),
+      GMAIL_PASS: checkEnv("GMAIL_APP_PASSWORD") || checkEnv("GMAIL_PASS") || checkEnv("GMAIL_PASSWORD"),
       HUBSPOT_TOKEN: checkEnv("HUBSPOT_ACCESS_TOKEN") || checkEnv("HUBSPOT_TOKEN"),
-      GEMINI_API_KEY: checkEnv("GEMINI_API_KEY") || checkEnv("CUSTOM_GEMINI_API_KEY"),
+      GEMINI_API_KEY: checkEnv("GEMINI_API_KEY") || checkEnv("CUSTOM_GEMINI_API_KEY") || checkEnv("GOOGLE_API_KEY"),
       PUBLIC_APP_URL: checkEnv("PUBLIC_APP_URL"),
     }
   });
