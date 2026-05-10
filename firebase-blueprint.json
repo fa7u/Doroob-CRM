@@ -1,0 +1,90 @@
+{
+  "entities": {
+    "Invitation": {
+      "title": "Invitation",
+      "description": "An invitation sent to a HubSpot contact or a guest.",
+      "type": "object",
+      "properties": {
+        "email": { "type": "string" },
+        "name": { "type": "string" },
+        "sentAt": { "type": "string", "format": "date-time" },
+        "status": { "type": "string", "enum": ["pending", "sent", "yes", "no", "clicked"] },
+        "attendance": { "type": "string", "enum": ["attended", "absent"] },
+        "sessionDetails": {
+          "type": "object",
+          "properties": {
+            "title": { "type": "string" },
+            "date": { "type": "string" },
+            "time": { "type": "string" },
+            "location": { "type": "string" },
+            "locationName": { "type": "string" },
+            "locationLink": { "type": "string" }
+          }
+        },
+        "mode": { "type": "string" },
+        "messageId": { "type": "string" },
+        "provider": { "type": "string" },
+        "clickedAt": { "type": "string", "format": "date-time" },
+        "checkedInAt": { "type": "string", "format": "date-time" },
+        "checkInMethod": { "type": "string" },
+        "reminded3h": { "type": "boolean" }
+      },
+      "required": ["email", "name", "sentAt", "status"]
+    },
+    "Settings": {
+      "title": "Settings",
+      "description": "Global settings for the application integration.",
+      "type": "object",
+      "properties": {
+        "gmailUser": { "type": "string" },
+        "gmailPass": { "type": "string" },
+        "hubspotToken": { "type": "string" },
+        "publicAppUrl": { "type": "string" },
+        "geminiApiKey": { "type": "string" },
+        "feedbackLink": { "type": "string", "description": "Link to the post-session survey or feedback form." }
+      }
+    },
+    "SessionArchive": {
+      "title": "Session Archive",
+      "description": "A summarized report of a completed session.",
+      "type": "object",
+      "properties": {
+        "title": { "type": "string" },
+        "sessionDate": { "type": "string" },
+        "archivedAt": { "type": "string", "format": "date-time" },
+        "totalInvited": { "type": "number" },
+        "confirmedAttending": { "type": "number" },
+        "attendedCount": { "type": "number" },
+        "confirmedButAbsent": { "type": "number" },
+        "apologizedCount": { "type": "number" },
+        "noResponseCount": { "type": "number" },
+        "notes": { "type": "string" },
+        "attendees": { 
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "name": { "type": "string" },
+              "email": { "type": "string" }
+            }
+          }
+        }
+      },
+      "required": ["title", "archivedAt", "totalInvited"]
+    }
+  },
+  "firestore": {
+    "invitations/{invitationId}": {
+      "schema": "Invitation",
+      "description": "Collection of all invitations."
+    },
+    "settings/global": {
+      "schema": "Settings",
+      "description": "Global application configuration."
+    },
+    "archives/{archiveId}": {
+      "schema": "SessionArchive",
+      "description": "Historical records of completed sessions."
+    }
+  }
+}
