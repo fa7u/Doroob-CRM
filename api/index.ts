@@ -12,37 +12,57 @@ import { initializeApp, getApps, applicationDefault } from 'firebase-admin/app';
 import { getFirestore } from 'firebase-admin/firestore';
 import { initializeApp as initializeClientApp } from 'firebase/app';
 import { initializeFirestore, doc as clientDoc, setDoc as clientSetDoc, getDoc as clientGetDoc, collection as clientCollection, getDocs as clientGetDocs, deleteDoc as clientDeleteDoc } from 'firebase/firestore';
-import firebaseConfig from '../firebase-applet-config.json' with { type: 'json' };
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+// Use multiple strategies to find the config file
+const getFirebaseConfig = () => {
+    const paths = [
+        path.join(process.cwd(), 'firebase-applet-config.json'),
+        path.join(__dirname, '../firebase-applet-config.json'),
+        path.join(__dirname, 'firebase-applet-config.json')
+    ];
+    for (const p of paths) {
+        if (fs.existsSync(p)) {
+            console.log(`[Firebase] Config found at: ${p}`);
+            return JSON.parse(fs.readFileSync(p, 'utf8'));
+        }
+    }
+    // Fallback if not found during build, maybe it's in the bundle
+    try {
+        return JSON.parse(fs.readFileSync('firebase-applet-config.json', 'utf8'));
+    } catch (e) {}
+    throw new Error("firebase-applet-config.json not found in any expected location");
+};
+
+const firebaseConfig = getFirebaseConfig();
 
 dotenv.config();
 
 // Initialize Firebase Admin (Preferred for server-side)
 if (getApps().length === 0) {
   try {
-    // On Vercel, applicationDefault() usually fails unless configured with GOOGLE_APPLICATION_CREDENTIALS
-    // We try to use projectId from config first
     if (process.env.VERCEL === "1") {
-       console.log("[Firebase Admin] Running on Vercel, skipping applicationDefault due to known issues.");
        initializeApp({ projectId: firebaseConfig.projectId });
     } else {
        initializeApp({
          credential: applicationDefault(),
          projectId: firebaseConfig.projectId || process.env.GOOGLE_CLOUD_PROJECT
        });
-       console.log("[Firebase Admin] Initialized with applicationDefault");
     }
   } catch (e: any) {
-    console.warn("[Firebase Admin] Init failed, trying basic init:", e.message);
     try { initializeApp({ projectId: firebaseConfig.projectId }); } catch (inner) {}
   }
 }
 
-// Initialize Firebase Client SDK as a resilient backup
+// Initialize Firebase Client SDK
 const clientApp = initializeClientApp(firebaseConfig);
 const clientDb = initializeFirestore(clientApp, {
   experimentalForceLongPolling: true
 }, firebaseConfig.firestoreDatabaseId || "(default)");
-console.log("[Firebase Client SDK] Initialized as backup (Long Polling Enabled)");
+
+const app = express();
 
 // Initialize Firestore Admin instance
 let firestore: any;
@@ -57,53 +77,36 @@ const memDb = {
 async function autoInit() {
   try {
      const dbId = firebaseConfig.firestoreDatabaseId;
-     console.log(`[Firestore Admin SDK] Initializing - Configured DB ID: ${dbId || "(default)"}`);
      
-     // 1. Try explicit databaseId if provided (Priority)
+     // 1. Try explicit databaseId if provided
      if (dbId && dbId !== "(default)") {
        try {
          const db = getFirestore(dbId);
-         // Heartbeat check with timeout
          await Promise.race([
            db.collection("settings").limit(1).get(),
            new Promise((_, reject) => setTimeout(() => reject(new Error("Timeout")), 2000))
          ]);
          firestore = db;
-         console.log(`[Firestore Admin SDK] SUCCESS: Using Configured DB "${dbId}"`);
          return;
-       } catch (err: any) {
-         console.warn(`[Firestore Admin SDK] Configured DB "${dbId}" check failed:`, err.message);
-       }
+       } catch (err: any) {}
      }
      
-     // 2. Try Default instance (no args)
+     // 2. Try Default instance
      try {
        const db = getFirestore();
-       // Heartbeat check with timeout
        await Promise.race([
          db.collection("settings").limit(1).get(),
          new Promise((_, reject) => setTimeout(() => reject(new Error("Timeout")), 2000))
        ]);
        firestore = db;
-       console.log(`[Firestore Admin SDK] SUCCESS: Using Default DB`);
        return;
-     } catch (err: any) {
-       console.warn(`[Firestore Admin SDK] Default DB check failed:`, err.message);
-     }
+     } catch (err: any) {}
 
-     // Final fallback: Use default handle and allow it to fail at call-site or use memDb
      firestore = getFirestore();
-     console.log("[Firestore Admin SDK] Falling back to default handle (heartbeat failed).");
   } catch (err: any) {
-     console.error("CRITICAL: Firestore initialization error:", err.message);
      firestore = getFirestore();
   }
 }
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-
-const app = express();
 
 async function startServer() {
   await autoInit();
@@ -113,8 +116,6 @@ async function startServer() {
   app.use(express.urlencoded({ extended: true }));
   app.use(cors());
   app.set('trust proxy', true);
-
-  // Firestore Persistence Helpers (Using Admin SDK)
   const INV_COL = "invitations";
   const SETTINGS_COL = "settings";
   const GLOBAL_SETTINGS_ID = "global";
@@ -1533,19 +1534,15 @@ async function startServer() {
       appType: "spa",
     });
     app.use(vite.middlewares);
-  } else {
-    // In production (Vercel or standard), serve static files
+  } else if (process.env.VERCEL !== "1") {
+    // Standard production (non-vercel)
     const distPath = path.join(process.cwd(), "dist");
     app.use(express.static(distPath));
     app.get("*", (req, res) => {
-      const filePath = path.join(distPath, req.path);
-      if (fs.existsSync(filePath) && fs.statSync(filePath).isFile()) {
-        res.sendFile(filePath);
-      } else {
-        res.sendFile(path.join(distPath, "index.html"));
-      }
+      res.sendFile(path.join(distPath, "index.html"));
     });
   }
+  // On Vercel, static files are handled by vercel.json and the platform
 
   // Only listen if not on Vercel
   if (process.env.VERCEL !== "1") {
