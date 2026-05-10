@@ -238,7 +238,10 @@ export default function App() {
         body: JSON.stringify(settings),
       });
       if (res.ok) {
-        setStatus({ type: 'success', message: 'تم حفظ الإعدادات بنجاح' });
+        const data = await res.json();
+        let storageMsg = ' (محفوظ في قاعدة البيانات)';
+        if (data.type === 'memory') storageMsg = ' (محفوظ في الذاكرة المؤقتة فقط - لن يستمر بعد إعادة التشغيل)';
+        setStatus({ type: 'success', message: 'تم حفظ الإعدادات بنجاح' + storageMsg });
         checkAiHealth();
       }
     } catch (e) {
@@ -1392,10 +1395,10 @@ function SystemStatusPanel() {
           <div className="bg-white/5 p-4 rounded-2xl border border-white/5">
              <span className="text-[10px] text-slate-500 block mb-2 font-bold uppercase">متغيرات Vercel</span>
              <div className="space-y-2">
-                {Object.entries(status.variablesPresent).map(([key, present]: any) => (
+                {Object.entries(status.variables || {}).map(([key, value]: any) => (
                   <div key={key} className="flex items-center justify-between text-xs">
                      <span className="font-mono text-slate-400">{key}</span>
-                     {present ? <CheckCircle2 size={14} className="text-green-400" /> : <AlertCircle size={14} className="text-red-400" />}
+                     {String(value).startsWith("Present") ? <CheckCircle2 size={14} className="text-green-400" /> : <AlertCircle size={14} className="text-red-400" />}
                   </div>
                 ))}
              </div>
@@ -1403,7 +1406,8 @@ function SystemStatusPanel() {
           <div className="bg-white/5 p-4 rounded-2xl border border-white/5">
              <span className="text-[10px] text-slate-500 block mb-2 font-bold uppercase">قاعدة البيانات (Firebase)</span>
              <div className="text-sm font-bold text-slate-200">{status.firestore}</div>
-             <p className="text-[10px] text-slate-500 mt-2 leading-relaxed">إذا كان NULL، فسيستخدم السيرفر مفاتيح Vercel المباشرة كبديل مستقر.</p>
+             <div className="text-[10px] text-slate-300 mt-1">Project ID: <span className="font-mono text-orange-400">{status.configSource}</span></div>
+             <p className="text-[10px] text-slate-500 mt-3 leading-relaxed">إذا كان NULL، فسيستخدم السيرفر مفاتيح Vercel المباشرة كبديل مستقر.</p>
           </div>
         </div>
       ) : (

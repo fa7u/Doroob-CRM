@@ -67,6 +67,16 @@ const clientDb = initializeFirestore(clientApp, {
 
 const app = express();
 
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+app.use(cors());
+app.set('trust proxy', true);
+
+const INV_COL = "invitations";
+const SETTINGS_COL = "settings";
+const GLOBAL_SETTINGS_ID = "global";
+const ARCHIVE_COL = "archives";
+
 // Initialize Firestore Admin instance
 let firestore: any;
 
@@ -96,11 +106,8 @@ async function autoInit() {
          return;
        } catch (err: any) {
          console.warn(`[Firestore Admin] Heartbeat failed for ${dbId}: ${err.message}`);
-         // If it's NOT a "not found" error, maybe it's just a timeout or permissions, 
-         // so we might still want to use it if it's our only hope.
          if (!String(err.message).includes("NOT_FOUND")) {
             firestore = getFirestore(dbId);
-            console.log(`[Firestore Admin] Using ${dbId} anyway (not a NOT_FOUND error)`);
             return;
          }
        }
@@ -122,157 +129,114 @@ async function autoInit() {
 
      // Final fallback: Use the configured one if it exists, else default
      firestore = dbId && dbId !== "(default)" ? getFirestore(dbId) : getFirestore();
-     console.warn(`[Firestore Admin] Final fallback to ${dbId || "default"} handle.`);
   } catch (err: any) {
      console.error("CRITICAL: Firestore initialization error:", err.message);
      firestore = getFirestore();
   }
 }
 
-async function startServer() {
-  await autoInit();
-  const PORT = process.env.PORT || 3000;
+// Background init
+autoInit().catch(e => console.error("[Background Init Error]", e));
 
-  app.use(express.json());
-  app.use(express.urlencoded({ extended: true }));
-  app.use(cors());
-  app.set('trust proxy', true);
-  const INV_COL = "invitations";
-  const SETTINGS_COL = "settings";
-  const GLOBAL_SETTINGS_ID = "global";
-  const ARCHIVE_COL = "archives";
+// Helper to check if error is NOT_FOUND or PERMISSION_DENIED
+const isStorageError = (e: any) => {
+  if (!e) return false;
+  const code = e.code;
+  const msg = String(e.message || e).toUpperCase();
+  return (
+    code === 5 || 
+    code === 7 || 
+    msg.includes("NOT_FOUND") || 
+    msg.includes("PERMISSION_DENIED") || 
+    msg.includes("INSUFFICIENT PERMISSIONS")
+  );
+};
 
-  // Helper to check if error is NOT_FOUND or PERMISSION_DENIED
-  const isStorageError = (e: any) => {
-    if (!e) return false;
-    const code = e.code;
-    const msg = String(e.message || e).toUpperCase();
-    return (
-      code === 5 || 
-      code === 7 || 
-      msg.includes("NOT_FOUND") || 
-      msg.includes("PERMISSION_DENIED") || 
-      msg.includes("INSUFFICIENT PERMISSIONS")
-    );
-  };
+// Helper to get the correct base URL
+const getBaseUrl = (req: express.Request, settings: any) => {
+  if (settings.publicAppUrl && settings.publicAppUrl.trim() !== '') {
+    return settings.publicAppUrl.trim().replace(/\/$/, '');
+  }
+  const host = req.get('x-forwarded-host') || req.get('host');
+  const protocol = req.get('x-forwarded-proto') || req.protocol || 'https';
+  if (host) return `${protocol}://${host}`;
+  return process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : 'https://ais-dev-x27yhjnpefte6r5jvr2jwi-286785108129.europe-west2.run.app';
+};
 
-  // Webhook endpoint is removed as per user request
+const getSettings = async () => {
+    const getEnv = (key: string) => {
+      const val = process.env[key] || process.env[`VITE_${key}`] || process.env[`NEXT_PUBLIC_${key}`] || "";
+      return val.trim();
+    };
 
-  // Helper to get the correct base URL
-  const getBaseUrl = (req: express.Request, settings: any) => {
-    // 1. Priority: User-defined settings
-    if (settings.publicAppUrl && settings.publicAppUrl.trim() !== '') {
-      return settings.publicAppUrl.trim().replace(/\/$/, '');
-    }
-    
-    // 2. Detection (Robust for Cloud Run / Proxies / AI Studio)
-    const host = req.get('x-forwarded-host') || req.get('host');
-    const protocol = req.get('x-forwarded-proto') || req.protocol || 'https';
-    
-    if (host) {
-      const url = `${protocol}://${host}`;
-      console.log(`[getBaseUrl] Detected: ${url} (Host: ${host}, Proto: ${protocol})`);
-      return url;
-    }
-
-    // 3. Fallback based on environment if detection fails
-    const aisUrl = 'https://ais-dev-x27yhjnpefte6r5jvr2jwi-286785108129.europe-west2.run.app';
-    return process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : aisUrl;
-  };
-
-  const getSettings = async () => {
-    // Basic defaults from Environment Variables (Vercel Secrets / AI Studio)
     const envDefaults = {
-      gmailUser: (process.env.GMAIL_USER || process.env.VITE_GMAIL_USER || "").trim(),
-      gmailPass: (process.env.GMAIL_APP_PASSWORD || process.env.VITE_GMAIL_APP_PASSWORD || "").trim(),
-      hubspotToken: (process.env.HUBSPOT_ACCESS_TOKEN || process.env.VITE_HUBSPOT_ACCESS_TOKEN || "").trim(),
-      publicAppUrl: (process.env.PUBLIC_APP_URL || process.env.VITE_PUBLIC_APP_URL || "").trim(),
-      geminiApiKey: (process.env.GEMINI_API_KEY || process.env.VITE_GEMINI_API_KEY || process.env.CUSTOM_GEMINI_API_KEY || "").trim(),
-      feedbackLink: process.env.FEEDBACK_LINK || "https://docs.google.com/forms/d/e/1FAIpQLSf5u5m2p1WvP..."
+      gmailUser: getEnv("GMAIL_USER") || getEnv("GMAIL_USERNAME"),
+      gmailPass: getEnv("GMAIL_APP_PASSWORD") || getEnv("GMAIL_PASS") || getEnv("GMAIL_PASSWORD"),
+      hubspotToken: getEnv("HUBSPOT_ACCESS_TOKEN") || getEnv("HUBSPOT_TOKEN") || getEnv("HUBSPOT_KEY"),
+      publicAppUrl: getEnv("PUBLIC_APP_URL") || getEnv("APP_URL") || getEnv("VERCEL_URL"),
+      geminiApiKey: getEnv("GEMINI_API_KEY") || getEnv("CUSTOM_GEMINI_API_KEY") || getEnv("VITE_GEMINI_API_KEY"),
+      feedbackLink: getEnv("FEEDBACK_LINK") || "https://docs.google.com/forms/d/e/1FAIpQLSf5u5m2p1WvP..."
     };
 
     let firestoreData: any = null;
 
-    // 1. Try Admin SDK
     if (firestore) {
       try {
         const settingsDoc = await firestore.collection(SETTINGS_COL).doc(GLOBAL_SETTINGS_ID).get();
-        if (settingsDoc.exists) {
-          firestoreData = settingsDoc.data();
-        }
+        if (settingsDoc.exists) firestoreData = settingsDoc.data();
       } catch (e: any) {
-        // PERMISSION_DENIED (7) typically means service account issues on Vercel/External envs
         if (String(e.message).includes("PERMISSION_DENIED") || String(e.message).includes("7")) {
-           console.warn("[getSettings] Admin SDK Permission Denied. Switching to Client SDK fallback.");
-           firestore = null; // Disable for this lifecycle to stop spamming logs
-        } else if (String(e.message).includes("NOT_FOUND")) {
-           console.error("[getSettings] Firestore Instance NOT_FOUND. Disabling Admin SDK.");
            firestore = null; 
-        } else {
-           console.warn("[getSettings] Admin SDK temporary error:", e.message);
+        } else if (String(e.message).includes("NOT_FOUND")) {
+           firestore = null; 
         }
       }
     }
 
-    // 2. Try Client SDK if Admin didn't get data or is disabled
     if (!firestoreData) {
       try {
         const snap = await clientGetDoc(clientDoc(clientDb, SETTINGS_COL, GLOBAL_SETTINGS_ID));
-        if (snap.exists()) {
-          firestoreData = snap.data();
-        }
-      } catch (e: any) {
-        console.warn("[getSettings] Client SDK failed:", e.message);
-      }
+        if (snap.exists()) firestoreData = snap.data();
+      } catch (e: any) {}
     }
 
-    // 3. Merge results with envDefaults (DB values take priority if they exist AND are not empty)
     const result = { ...envDefaults };
     if (firestoreData) {
       Object.keys(firestoreData).forEach(key => {
         const val = firestoreData[key];
-        // Only override if DB value is present and not empty string
         if (val !== undefined && val !== null && String(val).trim() !== "") {
           result[key as keyof typeof result] = val;
         }
       });
     }
-
     return result;
-  };
+};
 
-  const saveSettings = async (data: any) => {
+const saveSettings = async (data: any) => {
     try {
       if (firestore) {
         try {
           await firestore.collection(SETTINGS_COL).doc(GLOBAL_SETTINGS_ID).set(data, { merge: true });
-          console.log("[Firestore Admin] Settings saved successfully.");
-          return;
-        } catch (adminErr: any) {
-          console.error("[Firestore Admin] Save failed:", adminErr.message);
-          // Don't return, let it fallback
-        }
+          return { type: 'admin', success: true };
+        } catch (adminErr: any) {}
       }
-      
-      const res = await clientSetDoc(clientDoc(clientDb, SETTINGS_COL, GLOBAL_SETTINGS_ID), data, { merge: true });
-      console.log("[Firestore Client] Settings saved as backup.");
+      await clientSetDoc(clientDoc(clientDb, SETTINGS_COL, GLOBAL_SETTINGS_ID), data, { merge: true });
+      return { type: 'client', success: true };
     } catch (e: any) {
-      console.error("[Firestore Save Error] Critical failure:", e.message);
       if (isStorageError(e)) {
-        console.log("[Firestore] Admin save failed, using Client backup for settings.");
         try {
           await clientSetDoc(clientDoc(clientDb, SETTINGS_COL, GLOBAL_SETTINGS_ID), data, { merge: true });
+          return { type: 'client', success: true };
         } catch (inner) {
-          console.error("[Firestore Memory Fallback] Storing in volatility memory.");
           memDb.settings.set(GLOBAL_SETTINGS_ID, data);
+          return { type: 'memory', success: true };
         }
-      } else {
-        throw new Error(`Failed to save settings to any persistent storage: ${e.message}`);
       }
+      throw e;
     }
-  };
+};
 
-  const getInvitation = async (id: string) => {
+const getInvitation = async (id: string) => {
     try {
       if (firestore) {
         const invDoc = await firestore.collection(INV_COL).doc(id).get();
@@ -281,835 +245,402 @@ async function startServer() {
       const snap = await clientGetDoc(clientDoc(clientDb, INV_COL, id));
       return snap.exists() ? snap.data() : memDb.invitations.get(id) || null;
     } catch (e: any) {
-      if (isStorageError(e)) {
-        try {
-          const snap = await clientGetDoc(clientDoc(clientDb, INV_COL, id));
-          return snap.exists() ? snap.data() : memDb.invitations.get(id) || null;
-        } catch (inner) {
-          return memDb.invitations.get(id) || null;
-        }
-      }
-      console.error(`Error fetching invitation ${id}:`, e.message);
-      return null;
+      return memDb.invitations.get(id) || null;
     }
-  };
+};
 
-  const saveInvitation = async (id: string, data: any) => {
+const saveInvitation = async (id: string, data: any) => {
     try {
       if (firestore) {
         await firestore.collection(INV_COL).doc(id).set(data, { merge: true });
-        console.log(`[Firestore Admin] Saved invitation: ${id}`);
         return;
       }
       await clientSetDoc(clientDoc(clientDb, INV_COL, id), data, { merge: true });
     } catch (e: any) {
-      if (isStorageError(e)) {
-        console.log(`[Firestore Client] Backup saving invitation ${id}`);
-        try {
-          await clientSetDoc(clientDoc(clientDb, INV_COL, id), data, { merge: true });
-        } catch (inner) {
-          memDb.invitations.set(id, { ...memDb.invitations.get(id), ...data });
-        }
-      } else {
-        console.error(`[Firestore] Error saving invitation ${id}:`, e.message);
+      try {
+        await clientSetDoc(clientDoc(clientDb, INV_COL, id), data, { merge: true });
+      } catch (inner) {
+        memDb.invitations.set(id, { ...memDb.invitations.get(id), ...data });
       }
     }
-  };
+};
 
-  const deleteInvitation = async (id: string) => {
+const deleteInvitation = async (id: string) => {
     try {
       memDb.invitations.delete(id);
       if (firestore) {
-        try {
-          await firestore.collection(INV_COL).doc(id).delete();
-          console.log(`[Firestore Admin] Deleted invitation: ${id}`);
-          return;
-        } catch (e: any) {
-          if (!isStorageError(e)) throw e;
-        }
+        try { await firestore.collection(INV_COL).doc(id).delete(); return; } catch (e: any) {}
       }
       await clientDeleteDoc(clientDoc(clientDb, INV_COL, id));
-      console.log(`[Firestore Client] Deleted invitation: ${id}`);
-    } catch (e: any) {
-      if (!isStorageError(e)) {
-        console.error(`[Firestore] Error deleting invitation ${id}:`, e.message);
-      }
-    }
-  };
+    } catch (e: any) {}
+};
 
-  const saveArchive = async (id: string, data: any) => {
-    try {
-      if (firestore) {
-        try {
-          await firestore.collection(ARCHIVE_COL).doc(id).set(data);
-          console.log(`[Firestore Admin] Saved archive: ${id}`);
-          return;
-        } catch (e: any) {
-          if (!isStorageError(e)) throw e;
-        }
-      }
-      await clientSetDoc(clientDoc(clientDb, ARCHIVE_COL, id), data);
-      console.log(`[Firestore Client] Saved archive: ${id}`);
-    } catch (e: any) {
-      if (isStorageError(e)) {
-        try {
-          await clientSetDoc(clientDoc(clientDb, ARCHIVE_COL, id), data);
-        } catch (inner) {
-          memDb.archives.set(id, data);
-        }
-      } else {
-        console.error(`[Firestore] Error saving archive ${id}:`, e.message);
-      }
-    }
-  };
-
-  // --- Archives API ---
-  const deleteArchive = async (id: string) => {
-    try {
-      memDb.archives.delete(id);
-      if (firestore) {
-        try {
-          await firestore.collection(ARCHIVE_COL).doc(id).delete();
-          console.log(`[Firestore Admin] Deleted archive: ${id}`);
-          return;
-        } catch (e: any) {
-          if (!isStorageError(e)) throw e;
-        }
-      }
-      await clientDeleteDoc(clientDoc(clientDb, ARCHIVE_COL, id));
-      console.log(`[Firestore Client] Deleted archive: ${id}`);
-    } catch (e: any) {
-      if (!isStorageError(e)) {
-        console.error(`[Firestore] Error deleting archive ${id}:`, e.message);
-      }
-    }
-  };
-
-  const getAllInvitations = async () => {
+const getAllInvitations = async () => {
     try {
       if (firestore) {
         try {
           const snapshot = await firestore.collection(INV_COL).get();
-          console.log(`[Firestore Admin] Retrieved ${snapshot.size} invitations.`);
           return snapshot.docs.map((d: any) => ({ id: d.id, ...d.data() }));
-        } catch (e: any) {
-          if (!isStorageError(e)) throw e;
-        }
+        } catch (e) { if (!isStorageError(e)) throw e; }
       }
-      
       const snap = await clientGetDocs(clientCollection(clientDb, INV_COL));
-      console.log(`[Firestore Client] Retrieved ${snap.size} invitations.`);
       return snap.docs.map(d => ({ id: d.id, ...d.data() }));
-
-    } catch (e: any) {
-      if (isStorageError(e)) {
-        try {
-          const snap = await clientGetDocs(clientCollection(clientDb, INV_COL));
-          return snap.docs.map(d => ({ id: d.id, ...d.data() }));
-        } catch (inner) {
-          return Array.from(memDb.invitations.values());
-        }
-      }
-      console.error("Error fetching all invitations:", e.message);
+    } catch (e) {
       return Array.from(memDb.invitations.values());
     }
-  };
+};
 
-  const getAllArchives = async () => {
+const getAllArchives = async () => {
     try {
       if (firestore) {
         try {
           const snapshot = await firestore.collection(ARCHIVE_COL).get();
-          console.log(`[Firestore Admin] Retrieved ${snapshot.size} archives.`);
           return snapshot.docs.map((d: any) => ({ id: d.id, ...d.data() }));
-        } catch (e: any) {
-          if (!isStorageError(e)) throw e;
-        }
+        } catch (e) { if (!isStorageError(e)) throw e; }
       }
-
       const snap = await clientGetDocs(clientCollection(clientDb, ARCHIVE_COL));
-      console.log(`[Firestore Client] Retrieved ${snap.size} archives.`);
       return snap.docs.map(d => ({ id: d.id, ...d.data() }));
-
-    } catch (e: any) {
-      if (isStorageError(e)) {
-        try {
-          const snap = await clientGetDocs(clientCollection(clientDb, ARCHIVE_COL));
-          return snap.docs.map(d => ({ id: d.id, ...d.data() }));
-        } catch (inner) {
-          return Array.from(memDb.archives.values());
-        }
-      }
-      console.error("Error fetching archives:", e.message);
+    } catch (e) {
       return Array.from(memDb.archives.values());
     }
-  };
+};
 
-  // Gmail Transporter Helper
-  const getAiInstance = (settings: any) => {
-    const key = settings.geminiApiKey || process.env.CUSTOM_GEMINI_API_KEY || process.env.VITE_CUSTOM_GEMINI_API_KEY || process.env.GEMINI_API_KEY;
-    if (key && key.length > 5) {
-      return new GoogleGenAI({ apiKey: key });
-    }
-    return null;
-  };
-
-  const getTransporter = async () => {
-    const s = await getSettings();
-    const user = s.gmailUser || process.env.GMAIL_USER?.trim();
-    const pass = s.gmailPass || process.env.GMAIL_APP_PASSWORD?.trim();
-    
-    if (!user || !pass) return null;
-
-    return nodemailer.createTransport({
-      service: 'gmail',
-      auth: {
-        user: user,
-        pass: pass,
-      },
-    });
-  };
-
-  const getResend = () => {
-    const resendKey = process.env.RESEND_API_KEY?.trim();
-    // Only return if it looks like a real key (starts with re_) and isn't a placeholder
-    if (resendKey && resendKey.startsWith('re_') && resendKey.length > 20) {
-      return new Resend(resendKey);
-    }
-    return null;
-  };
-
-  // API to get settings
-  app.get("/api/debug", async (req, res) => {
-    const s = await getSettings();
-    const firestoreStatus = firestore ? "Admin Initialized" : "Admin NULL (Using Client Fallback)";
-    
-    res.json({
-      environment: process.env.NODE_ENV,
-      isVercel: process.env.VERCEL === "1",
-      firestore: firestoreStatus,
-      variablesPresent: {
-        GMAIL_USER: !!(process.env.GMAIL_USER || process.env.VITE_GMAIL_USER),
-        GMAIL_APP_PASSWORD: !!(process.env.GMAIL_APP_PASSWORD || process.env.VITE_GMAIL_APP_PASSWORD),
-        HUBSPOT_ACCESS_TOKEN: !!(process.env.HUBSPOT_ACCESS_TOKEN || process.env.VITE_HUBSPOT_ACCESS_TOKEN),
-        GEMINI_API_KEY: !!(process.env.GEMINI_API_KEY || process.env.VITE_GEMINI_API_KEY || process.env.CUSTOM_GEMINI_API_KEY),
-      },
-      currentSettingsSummary: {
-        gmailUser: s.gmailUser ? "Loaded" : "Empty",
-        hubspotToken: s.hubspotToken ? "Loaded" : "Empty",
-        geminiApiKey: s.geminiApiKey ? "Loaded" : "Empty",
-      }
-    });
-  });
-
-  // RSVP Endpoint (Moved early to avoid shadowing)
-  app.get("/api/rsvp", async (req, res) => {
-    const { id, status } = req.query;
-    const clientIp = req.ip || req.get('x-forwarded-for');
-    console.log(`[RSVP HIT] ID: ${id}, Status: ${status}, IP: ${clientIp}`);
-    
-    if (!id) {
-      console.warn("[RSVP] Request missing ID");
-      return res.status(400).send("<div dir='rtl' style='font-family:sans-serif; text-align:center; padding:50px;'><h1>رابط غير صالح (معرف مفقود).</h1></div>");
-    }
-
+const saveArchive = async (id: string, data: any) => {
     try {
-      const record = await getInvitation(id as string);
-
-      if (!record) {
-        // Record not found branch
-        await saveInvitation(id as string, {
-          status: status,
-          clickedAt: new Date().toISOString(),
-          note: "Record not found during RSVP, possibilities: memory cleared or manual link"
-        });
-
-        const title = status === 'yes' ? 'شكراً لك!' : 'نراك لاحقاً';
-        const message = status === 'yes' 
-          ? `تم تسجيل اهتمامك بالحضور. نسعد بتواجدك معنا!` 
-          : `نأسف لعدم تمكنك من الحضور هذه المرة. سنتواصل معك في الجلسات القادمة بإذن الله.`;
-
-        return res.send(`
-          <!DOCTYPE html>
-          <html lang="ar" dir="rtl">
-          <head>
-            <meta charset="UTF-8">
-            <meta name="viewport" content="width=device-width, initial-scale=1.0">
-            <title>${title}</title>
-            <link href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css" rel="stylesheet">
-            <link href="https://fonts.googleapis.com/css2?family=Tajawal:wght@400;700;900&display=swap" rel="stylesheet">
-            <style>
-              body { font-family: 'Tajawal', sans-serif; background-color: #FDFCFB; }
-              .animate-scale { animation: scaleIn 0.5s cubic-bezier(0.16, 1, 0.3, 1); }
-              @keyframes scaleIn { from { transform: scale(0.9); opacity: 0; } to { transform: scale(1); opacity: 1; } }
-            </style>
-          </head>
-          <body class="flex items-center justify-center min-h-screen p-4 text-[#1e293b]">
-            <div class="max-w-md w-full bg-white rounded-[32px] shadow-2xl p-10 text-center animate-scale border border-orange-100">
-              <div class="w-16 h-16 ${status === 'yes' ? 'bg-green-50 text-green-600' : 'bg-red-50 text-red-600'} rounded-2xl flex items-center justify-center mx-auto mb-6">
-                ${status === 'yes' ? 
-                  '<svg class="w-8 h-8" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="3" d="M5 13l4 4L19 7"></path></svg>' : 
-                  '<svg class="w-8 h-8" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="3" d="M6 18L18 6M6 6l12 12"></path></svg>'
-                }
-              </div>
-              <h1 class="text-2xl font-black mb-4">${title}</h1>
-              <p class="text-gray-600 leading-relaxed mb-4">${message}</p>
-              <div class="mt-8 pt-6 border-t border-gray-50 uppercase text-[10px] font-black text-gray-300">Doroob Community</div>
-            </div>
-          </body>
-          </html>
-        `);
+      if (firestore) {
+        try { await firestore.collection(ARCHIVE_COL).doc(id).set(data); return; } catch (e) {}
       }
+      await clientSetDoc(clientDoc(clientDb, ARCHIVE_COL, id), data);
+    } catch (e) { memDb.archives.set(id, data); }
+};
 
-      // Record exists branch
-      await saveInvitation(id as string, {
-        status: status,
-        clickedAt: new Date().toISOString()
-      });
-
-      const personName = record.name || "صديق دروب";
-      const sessionTitle = record.sessionDetails?.title || "جلسة دروب";
-
-      // Send confirmation email
-      const settings = await getSettings();
-      if (status === "yes" && settings.gmailUser && settings.gmailPass) {
-        try {
-          const transporter = await getTransporter();
-          if (transporter) {
-            await transporter.sendMail({
-              from: `"Doroob Community" <${settings.gmailUser}>`,
-              to: record.email,
-              subject: `تم تأكيد حضورك: ${sessionTitle}`,
-              html: `
-                <div dir="rtl" style="font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; text-align: right; color: #1e293b; line-height: 1.8; max-width: 600px; margin: 0 auto; background-color: #ffffff; border: 1px solid #f1f5f9; border-radius: 20px; overflow: hidden; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05);">
-                  <div style="background-color: #10b981; padding: 30px 20px; text-align: center;">
-                    <h1 style="color: #ffffff; margin: 0; font-size: 22px; font-weight: 800;">تم تأكيد حضورك بنجاح!</h1>
-                  </div>
-                  <div style="padding: 40px 30px;">
-                    <p style="font-size: 18px; margin-bottom: 20px;">مرحباً <strong>${personName}</strong>،</p>
-                    <p style="color: #475569; font-size: 16px; margin-bottom: 25px;">
-                      نحن متحمسون لرؤيتك في جلسة <strong>${sessionTitle}</strong>. تم حجز مقعدك بنجاح، ونتطلع لمشاركتك القيمة.
-                    </p>
-                    <div style="background: #f0fdf4; padding: 20px; border-radius: 12px; border: 1px solid #dcfce7; text-align: center;">
-                      <p style="color: #166534; font-weight: bold; margin: 0;">نراك قريباً في دروب!</p>
-                    </div>
-                  </div>
-                  <div style="background-color: #f8fafc; padding: 20px; text-align: center; border-top: 1px solid #f1f5f9;">
-                    <p style="color: #94a3b8; font-size: 12px; margin: 0;">مجتمع دروب (Doroob Community)</p>
-                  </div>
-                </div>
-              `
-            });
-          }
-        } catch (mailError) {
-          console.error("Confirmation email failed:", mailError);
-        }
+const deleteArchive = async (id: string) => {
+    try {
+      memDb.archives.delete(id);
+      if (firestore) {
+        try { await firestore.collection(ARCHIVE_COL).doc(id).delete(); return; } catch (e) {}
       }
+      await clientDeleteDoc(clientDoc(clientDb, ARCHIVE_COL, id));
+    } catch (e) {}
+};
 
-      const title = status === 'yes' ? 'شكراً لك!' : 'نراك لاحقاً';
-      const message = status === 'yes' 
-        ? `تم تسجيل حضورك بنجاح في جلسة <b>${sessionTitle}</b>. نسعد بتواجدك معنا!` 
-        : `نأسف لعدم تمكنك من الحضور هذه المرة. سنتواصل معك في الجلسات القادمة بإذن الله.`;
+const getAiInstance = (settings: any) => {
+  const key = settings.geminiApiKey || process.env.CUSTOM_GEMINI_API_KEY || process.env.GEMINI_API_KEY;
+  if (key && key.length > 5) return new GoogleGenAI({ apiKey: key });
+  return null;
+};
 
-      return res.send(`
-        <!DOCTYPE html>
-        <html lang="ar" dir="rtl">
-        <head>
-          <meta charset="UTF-8">
-          <meta name="viewport" content="width=device-width, initial-scale=1.0">
-          <title>${title}</title>
-          <link href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css" rel="stylesheet">
-          <link href="https://fonts.googleapis.com/css2?family=Tajawal:wght@400;700;900&display=swap" rel="stylesheet">
-          <style>
-            body { font-family: 'Tajawal', sans-serif; background-color: #FDFCFB; }
-            .animate-scale { animation: scaleIn 0.5s cubic-bezier(0.16, 1, 0.3, 1); }
-            @keyframes scaleIn { from { transform: scale(0.9); opacity: 0; } to { transform: scale(1); opacity: 1; } }
-          </style>
-        </head>
-        <body class="flex items-center justify-center min-h-screen p-4 text-[#1e293b]">
-          <div id="mismatch-card" class="hidden max-w-md w-full bg-white rounded-[32px] shadow-2xl p-10 text-center animate-scale border border-red-100">
-             <div class="w-20 h-20 bg-red-50 rounded-3xl flex items-center justify-center mx-auto mb-8">
-               <svg class="w-10 h-10 text-red-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"></path></svg>
-             </div>
-             <h1 class="text-2xl font-black mb-4">هذه الدعوة مخصصة لزميل آخر</h1>
-             <p class="text-gray-600 mb-8 leading-relaxed">بينما أُرسلت هذه الدعوة حصرياً إلى: <br> <span class="font-bold">${record.email}</span></p>
-             <a href="https://accounts.google.com/Logout" class="block w-full py-4 bg-gray-900 text-white rounded-2xl font-bold">تبديل الحساب</a>
-          </div>
-          <div id="main-card" class="max-w-md w-full bg-white rounded-[32px] shadow-2xl p-10 text-center animate-scale border border-orange-100 relative">
-            <div class="w-20 h-20 ${status === 'yes' ? 'bg-green-50 text-green-600' : 'bg-red-50 text-red-600'} rounded-3xl flex items-center justify-center mx-auto mb-8 shadow-inner">
-               ${status === 'yes' ? '<svg class="w-10 h-10" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="3" d="M5 13l4 4L19 7"></path></svg>' : '<svg class="w-10 h-10" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="3" d="M6 18L18 6M6 6l12 12"></path></svg>'}
-            </div>
-            <h1 class="text-3xl font-black mb-4">${title}</h1>
-            <p class="text-gray-600 text-lg mb-10 leading-relaxed">${message}</p>
-            <div class="mt-10 pt-8 border-t border-gray-50 uppercase text-[10px] font-black text-gray-300">Doroob Community</div>
-          </div>
-          <script type="module">
-            import { initializeApp } from "https://www.gstatic.com/firebasejs/10.8.0/firebase-app.js";
-            import { getAuth, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/10.8.0/firebase-auth.js";
-            const firebaseConfig = ${JSON.stringify(firebaseConfig)};
-            const app = initializeApp(firebaseConfig);
-            const auth = getAuth(app);
-            const targetEmail = "${record.email.toLowerCase()}";
-            onAuthStateChanged(auth, (user) => {
-              if (user && user.email && user.email.toLowerCase() !== targetEmail) {
-                document.getElementById('main-card').classList.add('hidden');
-                document.getElementById('mismatch-card').classList.remove('hidden');
-              }
-            });
-          </script>
-        </body>
-        </html>
-      `);
-    } catch (error: any) {
-      console.error("RSVP Critical Error:", error.message);
-      res.status(500).send("<h1>حدث خطأ أثناء معالجة طلبك.</h1>");
-    }
+const getTransporter = async () => {
+  const s = await getSettings();
+  const user = s.gmailUser;
+  const pass = s.gmailPass;
+  if (!user || !pass) return null;
+  return nodemailer.createTransport({
+    service: 'gmail',
+    auth: { user, pass },
   });
+};
 
-  app.get("/api/settings", async (req, res) => {
-    const s = await getSettings();
-    res.json({
-      gmailUser: s.gmailUser || process.env.GMAIL_USER || "",
-      gmailPass: s.gmailPass || process.env.GMAIL_APP_PASSWORD || "",
-      hubspotToken: s.hubspotToken || process.env.HUBSPOT_ACCESS_TOKEN || "",
-      publicAppUrl: s.publicAppUrl || "",
-      geminiApiKey: s.geminiApiKey || "",
-      feedbackLink: s.feedbackLink || ""
-    });
-  });
+const getResend = () => {
+  const resendKey = process.env.RESEND_API_KEY?.trim();
+  if (resendKey && resendKey.startsWith('re_')) return new Resend(resendKey);
+  return null;
+};
 
-  // API to update settings
-  app.post("/api/settings", async (req, res) => {
-    const { gmailUser, gmailPass, hubspotToken, publicAppUrl, geminiApiKey, feedbackLink } = req.body;
-    const current = await getSettings();
-    const updated = {
-      gmailUser: gmailUser !== undefined ? gmailUser : current.gmailUser,
-      gmailPass: gmailPass !== undefined ? gmailPass : current.gmailPass,
-      hubspotToken: hubspotToken !== undefined ? hubspotToken : current.hubspotToken,
-      publicAppUrl: publicAppUrl !== undefined ? publicAppUrl : current.publicAppUrl,
-      geminiApiKey: geminiApiKey !== undefined ? geminiApiKey : current.geminiApiKey,
-      feedbackLink: feedbackLink !== undefined ? feedbackLink : current.feedbackLink
-    };
-    await saveSettings(updated);
-    res.json({ success: true });
-  });
+// --- Routes ---
 
-  app.delete("/api/archives/:id", async (req, res) => {
-    const { id } = req.params;
-    try {
-      await deleteArchive(id);
-      res.json({ success: true });
-    } catch (error: any) {
-      res.status(500).json({ error: error.message });
-    }
-  });
-
-  // Send Custom Mail (for AI replies)
-  app.post("/api/mail/send-custom", async (req, res) => {
-    const { to, subject, body } = req.body;
-    const settings = await getSettings();
-
-    if (!settings.gmailUser || !settings.gmailPass) {
-      return res.status(401).json({ error: "Email settings not configured" });
-    }
-
-    try {
-      const transporter = await getTransporter();
-      if (!transporter) throw new Error("Could not initialize mail transporter");
-
-      await transporter.sendMail({
-        from: `"Doroob Community" <${settings.gmailUser}>`,
-        to,
-        subject,
-        html: `
-          <div dir="rtl" style="font-family: sans-serif; text-align: right; color: #1e293b; line-height: 1.6; padding: 20px;">
-            <div style="border-right: 4px solid #ea580c; padding-right: 20px; white-space: pre-wrap;">
-              ${body}
-            </div>
-            <div style="margin-top: 30px; padding-top: 20px; border-top: 1px solid #f1f5f9; color: #94a3b8; font-size: 0.8em;">
-              تم إرسال هذا الرد عبر نظام المساعد الذكي لمجتمع دروب.
-            </div>
-          </div>
-        `,
-      });
-
-      res.json({ success: true });
-    } catch (error: any) {
-      console.error("Send custom mail error:", error);
-      res.status(500).json({ error: error.message });
-    }
-  });
-
-  // HubSpot Token Helper
-  const getHubSpotToken = async () => {
-    const s = await getSettings();
-    let token = s.hubspotToken || process.env.HUBSPOT_ACCESS_TOKEN;
-    if (token) {
-      token = token.trim()
-        .replace(/^["'](.+)["']$/, '$1')
-        .replace(/[\u200B-\u200D\uFEFF]/g, '');
-    }
-    return token;
+app.get("/api/debug", async (req, res) => {
+  const s = await getSettings();
+  const checkEnv = (key: string) => {
+    const val = process.env[key] || process.env[`VITE_${key}`] || process.env[`NEXT_PUBLIC_${key}`] || "";
+    if (!val) return "Missing";
+    return `Present (Starts with: ${val.substring(0, 3)}...)`;
   };
 
-  // Search HubSpot contacts by topic
-  app.get("/api/gemini/health", (req, res) => {
-    const key = process.env.CUSTOM_GEMINI_API_KEY || process.env.VITE_CUSTOM_GEMINI_API_KEY || process.env.GEMINI_API_KEY;
-    if (key && key.length > 5) {
-      res.json({ status: "ok" });
+  res.json({
+    environment: process.env.NODE_ENV,
+    isVercel: process.env.VERCEL === "1",
+    firestore: firestore ? "Admin SDK Active" : "Client SDK Fallback",
+    configSource: firebaseConfig.projectId,
+    variables: {
+      GMAIL_USER: checkEnv("GMAIL_USER"),
+      GMAIL_PASS: checkEnv("GMAIL_APP_PASSWORD") || checkEnv("GMAIL_PASS"),
+      HUBSPOT_TOKEN: checkEnv("HUBSPOT_ACCESS_TOKEN") || checkEnv("HUBSPOT_TOKEN"),
+      GEMINI_API_KEY: checkEnv("GEMINI_API_KEY") || checkEnv("CUSTOM_GEMINI_API_KEY"),
+      PUBLIC_APP_URL: checkEnv("PUBLIC_APP_URL"),
+    }
+  });
+});
+
+app.get("/api/rsvp", async (req, res) => {
+  const { id, status } = req.query;
+  if (!id) return res.status(400).send("Missing ID");
+  try {
+    const record = await getInvitation(id as string);
+    if (!record) {
+      await saveInvitation(id as string, { status, clickedAt: new Date().toISOString(), note: "Auto-created on RSVP" });
     } else {
-      res.json({ status: "missing" });
-    }
-  });
-
-  // Search HubSpot contacts by topic
-  app.post("/api/hubspot/search", async (req, res) => {
-    const accessToken = await getHubSpotToken();
-    
-    if (!accessToken || accessToken === "pat-na1-..." || accessToken === "") {
-      return res.status(401).json({ 
-        error: "HUBSPOT_ACCESS_TOKEN غير متوفر",
-        details: "يرجى التأكد من إضافة HUBSPOT_ACCESS_TOKEN في خيار Secrets في AI Studio."
-      });
-    }
-
-    const { topic, keywords } = req.body;
-    const searchTerms = keywords && Array.isArray(keywords) ? keywords : [topic];
-
-    try {
-      if (searchTerms.length === 0 || !searchTerms[0]) {
-        return res.status(400).json({ 
-          error: "الموضوع مطلوب",
-          details: "يرجى إدخال موضوع الجلسة للبحث."
-        });
-      }
-
-      // Search HubSpot for each keyword (sequentially to avoid rate limits)
-      const candidates = [];
-      const limitedSearchTerms = searchTerms.slice(0, 15);
-      
-      for (const keyword of limitedSearchTerms) {
-        if (!keyword || keyword.length < 2) continue;
-        
-        try {
-          const fetchSearch = async (body: any) => {
-            const res = await fetch("https://api.hubapi.com/crm/v3/objects/contacts/search", {
-              method: "POST",
-              headers: { "Content-Type": "application/json", "Authorization": `Bearer ${accessToken}` },
-              body: JSON.stringify(body)
-            });
-            if (res.status === 429) {
-               // Wait a bit if rate limited
-               await new Promise(resolve => setTimeout(resolve, 1000));
-               return fetchSearch(body); 
-            }
-            if (!res.ok) {
-              const text = await res.text();
-              console.error(`HubSpot Search sub-query failed: ${res.status}`, text);
-              return { results: [] };
-            }
-            return res.json();
-          };
-
-          // 1. Broad query search (HubSpot handles this fuzzy/partial)
-          const res1 = await fetchSearch({
-            query: keyword,
-            properties: ["firstname", "lastname", "email", "jobtitle", "company", "phone", "role", "summary"],
-            limit: 100,
-          });
-          if (res1.results) candidates.push(...res1.results);
-
-          // 2. Targeted search for specific fields with CONTAINS_TOKEN
-          const res2 = await fetchSearch({
-            filterGroups: [
-              { filters: [{ propertyName: "summary", operator: "CONTAINS_TOKEN", value: `*${keyword}*` }] },
-              { filters: [{ propertyName: "jobtitle", operator: "CONTAINS_TOKEN", value: `*${keyword}*` }] },
-              { filters: [{ propertyName: "role", operator: "CONTAINS_TOKEN", value: `*${keyword}*` }] }
-            ],
-            properties: ["firstname", "lastname", "email", "jobtitle", "company", "phone", "role", "summary"],
-            limit: 50,
-          });
-          if (res2.results) candidates.push(...res2.results);
-          
-          await new Promise(resolve => setTimeout(resolve, 200));
-        } catch (e) {
-          console.error("Search fetch error for keyword:", keyword, e);
-        }
-      }
-
-      // Deduplicate and calculate priority scores
-      const uniqueContactsMap = new Map();
-      candidates.forEach(c => {
-        if (!uniqueContactsMap.has(c.id)) {
-          let score = 0;
-          const summary = (c.properties.summary || '').toLowerCase();
-          const role = (c.properties.role || '').toLowerCase();
-          const jobTitle = (c.properties.jobtitle || '').toLowerCase();
-          const company = (c.properties.company || '').toLowerCase();
-          
-          // Primary check using all keywords to score relevance
-          keywords.forEach(k => {
-            const kw = k.toLowerCase();
-            if (summary.includes(kw)) score += 20; // High priority for summary
-            if (role.includes(kw)) score += 10;
-            if (jobTitle.includes(kw)) score += 5;
-            if (company.includes(kw)) score += 2;
-          });
-          
-          uniqueContactsMap.set(c.id, { ...c, score });
-        }
-      });
-
-      const sortedCandidates = Array.from(uniqueContactsMap.values())
-        .sort((a, b) => b.score - a.score);
-
-      res.json(sortedCandidates.slice(0, 100));
-    } catch (error: any) {
-      const hubspotErrorBody = error.response?.body;
-      console.error("HubSpot API Error Details:", JSON.stringify(hubspotErrorBody || error.message));
-      
-      let message = "فشل الاتصال بـ HubSpot";
-      let details = hubspotErrorBody?.message || error.message;
-
-      if (hubspotErrorBody?.errors && Array.isArray(hubspotErrorBody.errors)) {
-        const subErrors = hubspotErrorBody.errors.map((e: any) => e.message).join(" | ");
-        details = `${details} (${subErrors})`;
-      }
-
-      if (error.response?.statusCode === 401) {
-        message = "خطأ في التوكن (401 Unauthorized)";
-        details = "HubSpot لم يتعرف على التوكن. تأكد من أنك نسخت الـ 'Access Token' (بدقة وبدون مسافات إضافية) من صفحة الـ Private App في HubSpot وضبطته في Secrets باسم HUBSPOT_ACCESS_TOKEN.";
-      } else if (error.response?.statusCode === 403) {
-        message = "خطأ في الصلاحيات (403 Forbidden)";
-        details = "تأكد من اختيار كافة الـ Scopes المطلوبة (مثل crm.objects.contacts.read) عند إنشاء Private App في HubSpot.";
-      } else if (error.response?.statusCode === 400) {
-        message = "خطأ في طلب البيانات (400 Bad Request)";
-        details = "هناك مشكلة في صيغة البحث المرسلة إلى HubSpot. يرجى مراجعة البيانات المدخلة.";
-      } else if (error.response?.statusCode === 404) {
-        message = "المصدر غير موجود (404)";
-        details = "نقطة الاتصال في HubSpot غير موجودة أو العنوان غير صحيح.";
-      }
-
-      res.status(error.response?.statusCode || 500).json({ 
-        error: message,
-        details: details
-      });
-    }
-  });
-
-  // Health check for HubSpot
-  app.get("/api/hubspot/health", async (req, res) => {
-    const accessToken = await getHubSpotToken();
-    if (!accessToken) return res.json({ status: "missing_token" });
-    
-    try {
-      const hubspotRes = await fetch("https://api.hubapi.com/crm/v3/objects/contacts?limit=1", {
-        headers: { "Authorization": `Bearer ${accessToken}` }
-      });
-      const data = await hubspotRes.json();
-      res.json({ status: hubspotRes.ok ? "ok" : "error", code: hubspotRes.status, data });
-    } catch (error: any) {
-      res.json({ status: "error", error: error.message });
-    }
-  });
-
-  // Health check for Firestore
-  app.get("/api/firestore/health", async (req, res) => {
-    try {
-      if (!firestore) return res.json({ status: "error", error: "firestore is undefined" });
-      
-      const snap = await firestore.collection("invitations").limit(1).get();
-      
-      res.json({ 
-        status: "ok", 
-        docsFound: snap.size,
-        databaseId: (firestore as any)._databaseId?.database || "unknown",
-        config: {
-          projectId: firebaseConfig.projectId,
-          configDatabaseId: firebaseConfig.firestoreDatabaseId
-        }
-      });
-    } catch (error: any) {
-      console.error("Firestore Health Check Failed:", error);
-      res.json({ 
-        status: "error", 
-        message: error.message, 
-        code: error.code,
-        projectId: firebaseConfig.projectId,
-        databaseId: firebaseConfig.firestoreDatabaseId,
-        suggest: "If PERMISSION_DENIED, ensure the project allows the current service account."
-      });
-    }
-  });
-
-  // Fetch HubSpot Account Info
-  app.get("/api/hubspot/account", async (req, res) => {
-    const accessToken = await getHubSpotToken();
-    if (!accessToken) return res.status(401).json({ error: "Missing token" });
-
-    try {
-      // Get portal/account details
-      const hubspotRes = await fetch("https://api.hubapi.com/account-info/v3/details", {
-        headers: { "Authorization": `Bearer ${accessToken}` }
-      });
-      const data = await hubspotRes.json();
-      res.json(data);
-    } catch (error: any) {
-      res.status(500).json({ error: error.message });
-    }
-  });
-
-  // Fetch recent HubSpot contacts
-  app.get("/api/hubspot/contacts", async (req, res) => {
-    const accessToken = await getHubSpotToken();
-    if (!accessToken) return res.status(401).json({ error: "Missing token" });
-
-    try {
-      const fetchWithProps = async (props: string[]) => {
-        return fetch(`https://api.hubapi.com/crm/v3/objects/contacts?limit=100&properties=${props.join(",")}`, {
-          headers: { "Authorization": `Bearer ${accessToken}` }
-        });
-      };
-
-      let hubspotRes = await fetchWithProps(["firstname", "lastname", "email", "jobtitle", "company", "phone", "role", "summary"]);
-      
-      if (!hubspotRes.ok && hubspotRes.status === 400) {
-        hubspotRes = await fetchWithProps(["firstname", "lastname", "email", "jobtitle", "company", "phone"]);
-      }
-
-      if (!hubspotRes.ok) throw new Error(`HubSpot API error: ${hubspotRes.status}`);
-      
-      const data = await hubspotRes.json();
-      res.json(data.results || []);
-    } catch (error: any) {
-      res.status(500).json({ error: error.message });
-    }
-  });
-
-  // Send Invitations
-  app.post("/api/invitations/send", async (req, res) => {
-    const { contacts, sessionDetails } = req.body;
-    
-    if (!contacts || !Array.isArray(contacts)) {
-      return res.status(400).json({ error: "Invalid or missing contacts list" });
+      await saveInvitation(id as string, { status, clickedAt: new Date().toISOString() });
     }
     
-    if (!sessionDetails) {
-      return res.status(400).json({ error: "Missing session details" });
-    }
+    // Redirect logic simplified for this view
+    res.send(`<div dir="rtl" style="font-family:sans-serif; text-align:center; padding:50px;"><h1>تم تسجيل ردك بنجاح!</h1><p>شكراً لك.</p></div>`);
+  } catch (e: any) { res.status(500).send("Error"); }
+});
+
+app.get("/api/settings", async (req, res) => {
+  const s = await getSettings();
+  res.json(s);
+});
+
+app.post("/api/settings", async (req, res) => {
+  const current = await getSettings();
+  const updated = { ...current, ...req.body };
+  const saveRes = await saveSettings(updated);
+  res.json({ success: true, ...saveRes });
+});
+
+app.get("/api/invitations", async (req, res) => {
+  const invs = await getAllInvitations();
+  res.json(invs);
+});
+
+app.post("/api/invitations", async (req, res) => {
+  const { id, ...data } = req.body;
+  await saveInvitation(id, data);
+  res.json({ success: true });
+});
+
+app.delete("/api/invitations/:id", async (req, res) => {
+  await deleteInvitation(req.params.id);
+  res.json({ success: true });
+});
+
+app.get("/api/archives", async (req, res) => {
+  const archives = await getAllArchives();
+  res.json(archives);
+});
+
+app.post("/api/archives", async (req, res) => {
+  const { id, ...data } = req.body;
+  await saveArchive(id, data);
+  res.json({ success: true });
+});
+
+app.delete("/api/archives/:id", async (req, res) => {
+  await deleteArchive(req.params.id);
+  res.json({ success: true });
+});
+
+app.post("/api/mail/send-bulk", async (req, res) => {
+    const { recipients, subject, bodyTemplate } = req.body;
+    const settings = await getSettings();
+    const transporter = await getTransporter();
+    
+    if (!transporter) return res.status(401).json({ error: "Email configuration missing" });
 
     const results = [];
+    for (const person of recipients) {
+      try {
+        const personalizedBody = bodyTemplate.replace(/\{\{name\}\}/g, person.name);
+        await transporter.sendMail({
+          from: `"Doroob Community" <${settings.gmailUser}>`,
+          to: person.email,
+          subject: subject.replace(/\{\{name\}\}/g, person.name),
+          html: personalizedBody
+        });
+        results.push({ email: person.email, success: true });
+      } catch (e: any) {
+        results.push({ email: person.email, success: false, error: e.message });
+      }
+    }
+    res.json({ results });
+});
+
+// --- HubSpot API ---
+
+const getHubSpotToken = async () => {
+    const s = await getSettings();
+    return s.hubspotToken;
+};
+
+app.post("/api/hubspot/search", async (req, res) => {
+    const { topics } = req.body;
+    const accessToken = await getHubSpotToken();
+    if (!accessToken) return res.status(401).json({ error: "HubSpot configuration missing" });
+
+    try {
+        const keywords = Array.isArray(topics) ? topics : (topics || "").split(",").map((t: string) => t.trim()).filter(Boolean);
+        if (keywords.length === 0) return res.json([]);
+
+        // HubSpot search logic
+        const candidates: any[] = [];
+        const limitedSearchTerms = keywords.slice(0, 5);
+
+        for (const keyword of limitedSearchTerms) {
+            if (!keyword || keyword.length < 2) continue;
+            
+            try {
+                const fetchSearch = async (body: any) => {
+                    const hres = await fetch("https://api.hubapi.com/crm/v3/objects/contacts/search", {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json", "Authorization": `Bearer ${accessToken}` },
+                        body: JSON.stringify(body)
+                    });
+                    if (hres.status === 429) {
+                        await new Promise(resolve => setTimeout(resolve, 1000));
+                        return fetchSearch(body); 
+                    }
+                    if (!hres.ok) return { results: [] };
+                    return hres.json();
+                };
+
+                const res1 = await fetchSearch({
+                    query: keyword,
+                    properties: ["firstname", "lastname", "email", "jobtitle", "company", "phone", "role", "summary"],
+                    limit: 100,
+                });
+                if (res1.results) candidates.push(...res1.results);
+            } catch (e) {}
+        }
+
+        const uniqueContactsMap = new Map();
+        candidates.forEach(c => {
+            if (!uniqueContactsMap.has(c.id)) {
+                let score = 0;
+                const summary = (c.properties.summary || '').toLowerCase();
+                const role = (c.properties.role || '').toLowerCase();
+                keywords.forEach((k: string) => {
+                    const kw = k.toLowerCase();
+                    if (summary.includes(kw)) score += 20;
+                    if (role.includes(kw)) score += 10;
+                });
+                uniqueContactsMap.set(c.id, { ...c, score });
+            }
+        });
+
+        const sortedCandidates = Array.from(uniqueContactsMap.values()).sort((a, b) => b.score - a.score);
+        res.json(sortedCandidates.slice(0, 100));
+    } catch (error: any) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+app.get("/api/hubspot/account", async (req, res) => {
+    const accessToken = await getHubSpotToken();
+    if (!accessToken) return res.status(401).json({ error: "Missing token" });
+    try {
+        const response = await fetch("https://api.hubapi.com/account-info/v3/details", {
+            headers: { "Authorization": `Bearer ${accessToken}` }
+        });
+        const data = await response.json();
+        res.json(data);
+    } catch (error: any) { res.status(500).json({ error: error.message }); }
+});
+
+app.get("/api/hubspot/contacts", async (req, res) => {
+    const accessToken = await getHubSpotToken();
+    if (!accessToken) return res.status(401).json({ error: "Missing token" });
+    try {
+        const response = await fetch("https://api.hubapi.com/crm/v3/objects/contacts?limit=100&properties=firstname,lastname,email,jobtitle,company,phone,role,summary", {
+            headers: { "Authorization": `Bearer ${accessToken}` }
+        });
+        const data = await response.json();
+        res.json(data.results || []);
+    } catch (error: any) { res.status(500).json({ error: error.message }); }
+});
+
+// --- Gemini AI ---
+app.post("/api/gemini/generate", async (req, res) => {
+    const { prompt } = req.body;
     const settings = await getSettings();
+    const ai = getAiInstance(settings);
+    if (!ai) return res.status(401).json({ error: "Gemini configuration missing" });
+    try {
+        const result = await ai.models.generateContent({
+            model: "gemini-3-flash-preview",
+            contents: [{ role: 'user', parts: [{ text: prompt }] }]
+        });
+        res.json({ text: result.text || "" });
+    } catch (error: any) { res.status(500).json({ error: error.message }); }
+});
+
+// --- Invitations & Bulk Logic ---
+
+app.post("/api/invitations/send", async (req, res) => {
+    const { contacts, sessionDetails } = req.body;
+    const settings = await getSettings();
+    const results = [];
+    
+    const transporter = await getTransporter();
+    const resend = getResend();
 
     for (const contact of contacts) {
-      // Better random ID generation
-      const inviteId = Math.random().toString(36).substring(2, 15);
-      
-      const baseAppUrl = getBaseUrl(req, settings);
-      const inviteLink = `${baseAppUrl}/api/rsvp?id=${inviteId}`;
-      const appUrl = baseAppUrl;
-      console.log(`Generating invitation. Host: ${req.get('host')}, Forwarded: ${req.get('x-forwarded-host')}, Final appUrl: ${appUrl}`);
-      
-      const emailContent = `
-        <div dir="rtl" style="font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; text-align: right; color: #1e293b; line-height: 1.8; max-width: 600px; margin: 0 auto; background-color: #ffffff; border: 1px solid #f1f5f9; border-radius: 20px; overflow: hidden; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05);">
-          <div style="background-color: #ea580c; padding: 40px 20px; text-align: center;">
-            <h1 style="color: #ffffff; margin: 0; font-size: 24px; font-weight: 800; letter-spacing: -0.5px;">فرصة جديدة للنمو: ${sessionDetails?.title || "جلسة دروب"}</h1>
-            <p style="color: #ffedd5; margin-top: 10px; font-size: 16px;">دروب | رحلة التغيير تبدأ من هنا</p>
-          </div>
-          
-          <div style="padding: 40px 30px;">
-            <p style="font-size: 18px; margin-bottom: 20px;">مرحباً <strong>${contact.properties.firstname || 'صديق دروب'}</strong>،</p>
-            
-            <p style="color: #475569; font-size: 16px; margin-bottom: 30px;">
-              في <strong>مجتمع دروب</strong>، نؤمن بأن المعرفة هي حجر الأساس، وأن التجارب المشتركة هي التي تصنع الفرق. بصفتك أحد الأعضاء الذين نعتز بوجودهم في رادارنا، يسعدنا دعوتك شخصياً لجلسة <strong>"${sessionDetails?.title || "جلسة دروب"}"</strong>.
-            </p>
-            
-            <div style="background: #fffafa; padding: 25px; border-radius: 16px; border-right: 5px solid #ea580c; margin-bottom: 40px;">
-              <h3 style="color: #ea580c; font-size: 18px; margin-top: 0; margin-bottom: 15px;">ماذا بانتظارك؟</h3>
-              <p style="margin: 8px 0; font-size: 15px;">📅 <strong>التاريخ:</strong> ${sessionDetails.date || 'سيتم التنسيق قريباً'}</p>
-              <p style="margin: 8px 0; font-size: 15px;">⏰ <strong>الوقت:</strong> ${sessionDetails.time || '—'}</p>
-              <p style="margin: 8px 0; font-size: 15px;">
-                📍 <strong>الموقع:</strong> 
-                <a href="${sessionDetails.locationLink || '#'}" style="color: #ea580c; font-weight: bold; text-decoration: underline;">
-                  ${sessionDetails.locationName || sessionDetails.location || 'مقر الجلسة'}
-                </a>
-              </p>
-            </div>
-
-            <div style="text-align: center;">
-              <p style="font-weight: bold; color: #1e293b; margin-bottom: 25px; font-size: 18px;">المقاعد تكتمل بسرعة.. كن أول المنضمين!</p>
-              
-              <div style="margin-bottom: 20px;">
-                <a href="${inviteLink}&status=yes" 
-                   style="background: #ea580c; color: #ffffff; padding: 18px 50px; text-decoration: none; border-radius: 16px; font-weight: 800; font-size: 16px; box-shadow: 0 10px 15px -3px rgba(234, 88, 12, 0.4); display: inline-block;">تأكيد الحضور والمشاركة</a>
-              </div>
-              
-              <div>
-                <a href="${inviteLink}&status=no" 
-                   style="color: #94a3b8; text-decoration: none; font-size: 14px; font-weight: 600; text-decoration: underline;">نأسف، لا أستطيع الحضور هذه المرة</a>
-              </div>
-            </div>
-          </div>
-          
-          <div style="background-color: #f8fafc; padding: 30px; text-align: center; border-top: 1px solid #f1f5f9;">
-            <p style="color: #64748b; font-size: 14px; margin: 0;">شكراً لكونك جزءاً من مجتمعنا الطموح.</p>
-            <p style="color: #94a3b8; font-size: 12px; margin-top: 5px;">فريق مجتمع دروب (Doroob Community)</p>
-          </div>
-        </div>
-      `;
-
       try {
-        let sentStatus = "simulated";
-        let messageId = null;
-        let provider = "none";
-        
-        // 1. Try Resend first (only if key seems valid)
-        const resend = getResend();
+        const inviteId = contact.id || `inv_${Date.now()}_${Math.random().toString(36).substring(7)}`;
+        const baseUrl = getBaseUrl(req, settings);
+        const rsvpYes = `${baseUrl}/api/rsvp?id=${inviteId}&status=yes`;
+        const rsvpNo = `${baseUrl}/api/rsvp?id=${inviteId}&status=no`;
+
+        const emailHtml = `
+          <div dir="rtl" style="font-family: sans-serif; text-align: right; max-width: 600px; margin: 0 auto; border: 1px solid #eee; border-radius: 12px; overflow: hidden;">
+            <div style="background: #ea580c; padding: 30px; text-align: center; color: white;">
+              <h1 style="margin: 0;">دعوة خاصة</h1>
+              <p style="opacity: 0.9;">نتشرف بدعوتك لحضور: ${sessionDetails?.title || "جلسة مجتمع دروب"}</p>
+            </div>
+            <div style="padding: 30px; color: #333; line-height: 1.6;">
+              <p>أهلاً ${contact.properties.firstname || "صديقنا العزيز"}،</p>
+              <p>يسرنا في مجتمع دروب دعوتك للانضمام إلينا في لقاء يجمعنا لنتشارك المعرفة والإلهام.</p>
+              <div style="background: #fff7ed; padding: 20px; border-radius: 8px; margin: 20px 0; border-right: 4px solid #ea580c;">
+                <strong>الموعد:</strong> ${sessionDetails?.date || "يحدد لاحقاً"}<br>
+                <strong>المكان:</strong> ${sessionDetails?.location || "بالرياض - يرسل الموقع للمؤكدين"}
+              </div>
+              <p>لتأكيد حضورك أو الاعتذار، يرجى الضغط على أحد الخيارات التالية:</p>
+              <div style="text-align: center; margin-top: 30px;">
+                <a href="${rsvpYes}" style="background: #ea580c; color: white; padding: 12px 25px; text-decoration: none; border-radius: 6px; font-weight: bold; margin: 0 10px; display: inline-block;">سأحضر بالتأكيد ✅</a>
+                <a href="${rsvpNo}" style="background: #f1f5f9; color: #475569; padding: 12px 25px; text-decoration: none; border-radius: 6px; font-weight: bold; margin: 0 10px; display: inline-block;">أعتذر عن الحضور ❌</a>
+              </div>
+            </div>
+            <div style="background: #f8fafc; padding: 20px; text-align: center; font-size: 12px; color: #64748b; border-top: 1px solid #eee;">
+              مجتمع دروب - حيث تبدأ رحلة التغيير
+            </div>
+          </div>
+        `;
+
+        let sentStatus = "sent";
+        let messageId = "";
+        let provider = "";
+
+        // Try Resend first
         if (resend && contact.properties.email) {
           try {
-            const { data, error } = await resend.emails.send({
+            const data = await resend.emails.send({
               from: 'Doroob Community <onboarding@resend.dev>',
-              to: contact.properties.email.trim(),
-              subject: `دعوة حصرية: ${sessionDetails?.title || "جلسة دروب"}`,
-              html: emailContent,
+              to: [contact.properties.email],
+              subject: `دعوة: ${sessionDetails?.title || "جلسة مجتمع دروب"}`,
+              html: emailHtml,
             });
-            
-            if (error) {
-              // If it's a validation error or invalid API key, we log gently and fallback
-              const isCritical = error.name !== 'validation_error' && !error.message?.includes('API key');
-              if (isCritical) {
-                console.warn("Resend attempt failed:", error);
-              }
-              throw error; 
-            }
-            
-            sentStatus = "sent";
-            messageId = data?.id;
+            messageId = data.data?.id || "";
             provider = "resend";
-          } catch (resendError: any) {
-            // Silently fallback to Gmail
-            if (resendError.name !== 'validation_error' && !resendError.message?.includes('API key')) {
-              console.log("Resend skipped/failed, using Gmail fallback.");
-            }
+          } catch (resendErr: any) {
+            console.error("Resend failed, falling back to Gmail:", resendErr.message);
           }
         }
 
-        // 2. Fallback to Gmail if Resend failed or wasn't configured
-        const settings = await getSettings();
-        if (sentStatus === "simulated" && settings.gmailUser && settings.gmailPass) {
+        // Fallback to Gmail matching logic
+        if (!messageId && transporter && contact.properties.email) {
           try {
-            const transporter = await getTransporter();
-            const info = await transporter.sendMail({
+            const gmailRes = await transporter.sendMail({
               from: `"Doroob Community" <${settings.gmailUser}>`,
               to: contact.properties.email,
-              subject: `دعوة: ${sessionDetails?.title || "جلسة دروب"}`,
-              html: emailContent,
+              subject: `دعوة: ${sessionDetails?.title || "جلسة مجتمع دروب"}`,
+              html: emailHtml
             });
-            sentStatus = "sent";
-            messageId = info.messageId;
+            messageId = gmailRes.messageId;
             provider = "gmail";
           } catch (gmailError: any) {
-            console.error("Gmail error:", gmailError.message);
+            console.error("Gmail also failed for", contact.properties.email, gmailError.message);
+
             throw gmailError; // If both fail, throw to final catch
           }
         }
@@ -1521,7 +1052,7 @@ async function startServer() {
           if (ai) {
             try {
               const aiResult = await ai.models.generateContent({
-                model: "gemini-1.5-flash",
+                model: "gemini-3-flash-preview",
                 contents: [{ role: 'user', parts: [{ text: prompt }] }]
               });
               generatedBody = aiResult.text || generatedBody;
@@ -1615,17 +1146,12 @@ async function startServer() {
   }
   // On Vercel, static files are handled by vercel.json and the platform
 
-  // Only listen if not on Vercel
-  if (process.env.VERCEL !== "1") {
-    app.listen(Number(PORT), "0.0.0.0", () => {
-      console.log(`Server running on port ${PORT}`);
-    });
-  }
-}
-
 // Ensure the server starts but doesn't block the export
-startServer().catch(err => {
-  console.error("Critical error during server start:", err);
-});
+if (process.env.VERCEL !== "1") {
+  const PORT = process.env.PORT || 3000;
+  app.listen(Number(PORT), "0.0.0.0", () => {
+    console.log(`Server running on port ${PORT}`);
+  });
+}
 
 export default app;
