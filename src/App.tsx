@@ -1218,6 +1218,10 @@ export default function App() {
                       {settingsLoading ? <Loader2 className="animate-spin" /> : <ShieldCheck size={24} />}
                       حفظ جميع الإعدادات وتأمين النظام
                     </button>
+                    
+                    <div className="mt-8 pt-8 border-t border-slate-200">
+                      <SystemStatusPanel />
+                    </div>
                  </div>
               </div>
             )}
@@ -1340,6 +1344,75 @@ export default function App() {
           </motion.div>
         )}
       </AnimatePresence>
+    </div>
+  );
+}
+
+function SystemStatusPanel() {
+  const [status, setStatus] = useState<any>(null);
+  const [loading, setLoading] = useState(false);
+
+  const checkStatus = async () => {
+    setLoading(true);
+    try {
+      const res = await fetch('/api/debug');
+      const data = await res.json();
+      setStatus(data);
+    } catch (e) {
+      console.error(e);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div className="bg-slate-900 rounded-[2rem] p-8 text-white space-y-6 overflow-hidden relative">
+      <div className="relative z-10 flex items-center justify-between">
+        <div className="flex items-center gap-3">
+           <div className="w-10 h-10 bg-white/10 rounded-xl flex items-center justify-center backdrop-blur-md">
+             <ShieldCheck className="text-green-400" size={20} />
+           </div>
+           <h3 className="font-bold flex flex-col">
+             تشخيص حالة النظام
+             <span className="text-[10px] text-slate-400 font-normal">التأكد من قراءة مفاتيح Vercel</span>
+           </h3>
+        </div>
+        <button 
+          onClick={checkStatus} 
+          disabled={loading}
+          className="px-4 py-2 bg-white/10 hover:bg-white/20 rounded-xl text-xs font-bold transition-all flex items-center gap-2"
+        >
+          {loading ? <Loader2 size={14} className="animate-spin" /> : <RotateCcw size={14} />}
+          فحص الاتصال
+        </button>
+      </div>
+
+      {status ? (
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4 animate-fade-in relative z-10">
+          <div className="bg-white/5 p-4 rounded-2xl border border-white/5">
+             <span className="text-[10px] text-slate-500 block mb-2 font-bold uppercase">متغيرات Vercel</span>
+             <div className="space-y-2">
+                {Object.entries(status.variablesPresent).map(([key, present]: any) => (
+                  <div key={key} className="flex items-center justify-between text-xs">
+                     <span className="font-mono text-slate-400">{key}</span>
+                     {present ? <CheckCircle2 size={14} className="text-green-400" /> : <AlertCircle size={14} className="text-red-400" />}
+                  </div>
+                ))}
+             </div>
+          </div>
+          <div className="bg-white/5 p-4 rounded-2xl border border-white/5">
+             <span className="text-[10px] text-slate-500 block mb-2 font-bold uppercase">قاعدة البيانات (Firebase)</span>
+             <div className="text-sm font-bold text-slate-200">{status.firestore}</div>
+             <p className="text-[10px] text-slate-500 mt-2 leading-relaxed">إذا كان NULL، فسيستخدم السيرفر مفاتيح Vercel المباشرة كبديل مستقر.</p>
+          </div>
+        </div>
+      ) : (
+        <div className="text-center py-4 relative z-10">
+           <p className="text-slate-500 text-xs italic">اضغط على فحص الاتصال للتأكد من حالة المفاتيح...</p>
+        </div>
+      )}
+      
+      <div className="absolute top-0 right-0 w-64 h-64 bg-orange-600/5 rounded-full blur-[80px] -translate-y-1/2 translate-x-1/4"></div>
     </div>
   );
 }

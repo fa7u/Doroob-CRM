@@ -21,7 +21,8 @@ const getFirebaseConfig = () => {
     const paths = [
         path.join(process.cwd(), 'firebase-applet-config.json'),
         path.join(__dirname, '../firebase-applet-config.json'),
-        path.join(__dirname, 'firebase-applet-config.json')
+        path.join(__dirname, 'firebase-applet-config.json'),
+        path.join(process.cwd(), 'api', 'firebase-applet-config.json')
     ];
     for (const p of paths) {
         if (fs.existsSync(p)) {
@@ -29,11 +30,13 @@ const getFirebaseConfig = () => {
             return JSON.parse(fs.readFileSync(p, 'utf8'));
         }
     }
-    // Fallback if not found during build, maybe it's in the bundle
+    // Final fallback: check root relative to this file
     try {
-        return JSON.parse(fs.readFileSync('firebase-applet-config.json', 'utf8'));
+        const rootPath = path.resolve(__dirname, '..', 'firebase-applet-config.json');
+        if (fs.existsSync(rootPath)) return JSON.parse(fs.readFileSync(rootPath, 'utf8'));
     } catch (e) {}
-    throw new Error("firebase-applet-config.json not found in any expected location");
+
+    throw new Error("firebase-applet-config.json not found. Please ensure the file is in the root directory.");
 };
 
 const firebaseConfig = getFirebaseConfig();
@@ -77,33 +80,51 @@ const memDb = {
 async function autoInit() {
   try {
      const dbId = firebaseConfig.firestoreDatabaseId;
+     console.log(`[Firestore Admin] Starting Auto-Init. Config DB: ${dbId || "(default)"}`);
      
      // 1. Try explicit databaseId if provided
      if (dbId && dbId !== "(default)") {
        try {
          const db = getFirestore(dbId);
+         // Heartbeat
          await Promise.race([
            db.collection("settings").limit(1).get(),
-           new Promise((_, reject) => setTimeout(() => reject(new Error("Timeout")), 2000))
+           new Promise((_, reject) => setTimeout(() => reject(new Error("Timeout")), 2500))
          ]);
          firestore = db;
+         console.log(`[Firestore Admin] SUCCESS: Heartbeat passed for ${dbId}`);
          return;
-       } catch (err: any) {}
+       } catch (err: any) {
+         console.warn(`[Firestore Admin] Heartbeat failed for ${dbId}: ${err.message}`);
+         // If it's NOT a "not found" error, maybe it's just a timeout or permissions, 
+         // so we might still want to use it if it's our only hope.
+         if (!String(err.message).includes("NOT_FOUND")) {
+            firestore = getFirestore(dbId);
+            console.log(`[Firestore Admin] Using ${dbId} anyway (not a NOT_FOUND error)`);
+            return;
+         }
+       }
      }
      
-     // 2. Try Default instance
+     // 2. Try Default instance if no dbId or if named failed with NOT_FOUND
      try {
        const db = getFirestore();
        await Promise.race([
          db.collection("settings").limit(1).get(),
-         new Promise((_, reject) => setTimeout(() => reject(new Error("Timeout")), 2000))
+         new Promise((_, reject) => setTimeout(() => reject(new Error("Timeout")), 2500))
        ]);
        firestore = db;
+       console.log(`[Firestore Admin] SUCCESS: Connected to Default Database`);
        return;
-     } catch (err: any) {}
+     } catch (err: any) {
+       console.warn(`[Firestore Admin] Default Database heartbeat failed: ${err.message}`);
+     }
 
-     firestore = getFirestore();
+     // Final fallback: Use the configured one if it exists, else default
+     firestore = dbId && dbId !== "(default)" ? getFirestore(dbId) : getFirestore();
+     console.warn(`[Firestore Admin] Final fallback to ${dbId || "default"} handle.`);
   } catch (err: any) {
+     console.error("CRITICAL: Firestore initialization error:", err.message);
      firestore = getFirestore();
   }
 }
@@ -160,65 +181,93 @@ async function startServer() {
   };
 
   const getSettings = async () => {
-    try {
-      if (firestore) {
+    // Basic defaults from Environment Variables (Vercel Secrets / AI Studio)
+    const envDefaults = {
+      gmailUser: (process.env.GMAIL_USER || process.env.VITE_GMAIL_USER || "").trim(),
+      gmailPass: (process.env.GMAIL_APP_PASSWORD || process.env.VITE_GMAIL_APP_PASSWORD || "").trim(),
+      hubspotToken: (process.env.HUBSPOT_ACCESS_TOKEN || process.env.VITE_HUBSPOT_ACCESS_TOKEN || "").trim(),
+      publicAppUrl: (process.env.PUBLIC_APP_URL || process.env.VITE_PUBLIC_APP_URL || "").trim(),
+      geminiApiKey: (process.env.GEMINI_API_KEY || process.env.VITE_GEMINI_API_KEY || process.env.CUSTOM_GEMINI_API_KEY || "").trim(),
+      feedbackLink: process.env.FEEDBACK_LINK || "https://docs.google.com/forms/d/e/1FAIpQLSf5u5m2p1WvP..."
+    };
+
+    let firestoreData: any = null;
+
+    // 1. Try Admin SDK
+    if (firestore) {
+      try {
         const settingsDoc = await firestore.collection(SETTINGS_COL).doc(GLOBAL_SETTINGS_ID).get();
         if (settingsDoc.exists) {
-          const data = settingsDoc.data() || {};
-          if (!data.feedbackLink) {
-            data.feedbackLink = "https://docs.google.com/forms/d/e/1FAIpQLSf5u5m2p1WvP..." 
-          }
-          return data;
+          firestoreData = settingsDoc.data();
+        }
+      } catch (e: any) {
+        // PERMISSION_DENIED (7) typically means service account issues on Vercel/External envs
+        if (String(e.message).includes("PERMISSION_DENIED") || String(e.message).includes("7")) {
+           console.warn("[getSettings] Admin SDK Permission Denied. Switching to Client SDK fallback.");
+           firestore = null; // Disable for this lifecycle to stop spamming logs
+        } else if (String(e.message).includes("NOT_FOUND")) {
+           console.error("[getSettings] Firestore Instance NOT_FOUND. Disabling Admin SDK.");
+           firestore = null; 
+        } else {
+           console.warn("[getSettings] Admin SDK temporary error:", e.message);
         }
       }
-      
-      // Client Fallback if Admin failed or Doc not found in Admin
-      const snap = await clientGetDoc(clientDoc(clientDb, SETTINGS_COL, GLOBAL_SETTINGS_ID));
-      if (snap.exists()) return snap.data();
-      
-    } catch (e: any) {
-      if (isStorageError(e)) {
-        console.log("[Firestore] Admin access denied, trying client fallback for settings.");
-        try {
-          const snap = await clientGetDoc(clientDoc(clientDb, SETTINGS_COL, GLOBAL_SETTINGS_ID));
-          if (snap.exists()) return snap.data();
-        } catch (innerE) {
-           console.warn("[Firestore] Both Admin and Client failed for settings.");
-        }
-        return memDb.settings.get(GLOBAL_SETTINGS_ID) || {
-          gmailUser: process.env.GMAIL_USER || "",
-          gmailPass: process.env.GMAIL_APP_PASSWORD || "",
-          hubspotToken: process.env.HUBSPOT_ACCESS_TOKEN || "",
-          feedbackLink: "https://docs.google.com/forms/d/e/1FAIpQLSf5u5m2p1WvP..." 
-        };
-      }
-      console.error("Error fetching settings:", e.message);
     }
-    return {
-      gmailUser: process.env.GMAIL_USER || "",
-      gmailPass: process.env.GMAIL_APP_PASSWORD || "",
-      hubspotToken: process.env.HUBSPOT_ACCESS_TOKEN || "",
-      feedbackLink: "https://docs.google.com/forms/d/e/1FAIpQLSf5u5m2p1WvP..." 
-    };
+
+    // 2. Try Client SDK if Admin didn't get data or is disabled
+    if (!firestoreData) {
+      try {
+        const snap = await clientGetDoc(clientDoc(clientDb, SETTINGS_COL, GLOBAL_SETTINGS_ID));
+        if (snap.exists()) {
+          firestoreData = snap.data();
+        }
+      } catch (e: any) {
+        console.warn("[getSettings] Client SDK failed:", e.message);
+      }
+    }
+
+    // 3. Merge results with envDefaults (DB values take priority if they exist AND are not empty)
+    const result = { ...envDefaults };
+    if (firestoreData) {
+      Object.keys(firestoreData).forEach(key => {
+        const val = firestoreData[key];
+        // Only override if DB value is present and not empty string
+        if (val !== undefined && val !== null && String(val).trim() !== "") {
+          result[key as keyof typeof result] = val;
+        }
+      });
+    }
+
+    return result;
   };
 
   const saveSettings = async (data: any) => {
     try {
       if (firestore) {
-        await firestore.collection(SETTINGS_COL).doc(GLOBAL_SETTINGS_ID).set(data, { merge: true });
-        return;
+        try {
+          await firestore.collection(SETTINGS_COL).doc(GLOBAL_SETTINGS_ID).set(data, { merge: true });
+          console.log("[Firestore Admin] Settings saved successfully.");
+          return;
+        } catch (adminErr: any) {
+          console.error("[Firestore Admin] Save failed:", adminErr.message);
+          // Don't return, let it fallback
+        }
       }
-      await clientSetDoc(clientDoc(clientDb, SETTINGS_COL, GLOBAL_SETTINGS_ID), data, { merge: true });
+      
+      const res = await clientSetDoc(clientDoc(clientDb, SETTINGS_COL, GLOBAL_SETTINGS_ID), data, { merge: true });
+      console.log("[Firestore Client] Settings saved as backup.");
     } catch (e: any) {
+      console.error("[Firestore Save Error] Critical failure:", e.message);
       if (isStorageError(e)) {
         console.log("[Firestore] Admin save failed, using Client backup for settings.");
         try {
           await clientSetDoc(clientDoc(clientDb, SETTINGS_COL, GLOBAL_SETTINGS_ID), data, { merge: true });
         } catch (inner) {
+          console.error("[Firestore Memory Fallback] Storing in volatility memory.");
           memDb.settings.set(GLOBAL_SETTINGS_ID, data);
         }
       } else {
-        console.error("Error saving settings:", e.message);
+        throw new Error(`Failed to save settings to any persistent storage: ${e.message}`);
       }
     }
   };
@@ -431,6 +480,28 @@ async function startServer() {
   };
 
   // API to get settings
+  app.get("/api/debug", async (req, res) => {
+    const s = await getSettings();
+    const firestoreStatus = firestore ? "Admin Initialized" : "Admin NULL (Using Client Fallback)";
+    
+    res.json({
+      environment: process.env.NODE_ENV,
+      isVercel: process.env.VERCEL === "1",
+      firestore: firestoreStatus,
+      variablesPresent: {
+        GMAIL_USER: !!(process.env.GMAIL_USER || process.env.VITE_GMAIL_USER),
+        GMAIL_APP_PASSWORD: !!(process.env.GMAIL_APP_PASSWORD || process.env.VITE_GMAIL_APP_PASSWORD),
+        HUBSPOT_ACCESS_TOKEN: !!(process.env.HUBSPOT_ACCESS_TOKEN || process.env.VITE_HUBSPOT_ACCESS_TOKEN),
+        GEMINI_API_KEY: !!(process.env.GEMINI_API_KEY || process.env.VITE_GEMINI_API_KEY || process.env.CUSTOM_GEMINI_API_KEY),
+      },
+      currentSettingsSummary: {
+        gmailUser: s.gmailUser ? "Loaded" : "Empty",
+        hubspotToken: s.hubspotToken ? "Loaded" : "Empty",
+        geminiApiKey: s.geminiApiKey ? "Loaded" : "Empty",
+      }
+    });
+  });
+
   // RSVP Endpoint (Moved early to avoid shadowing)
   app.get("/api/rsvp", async (req, res) => {
     const { id, status } = req.query;
