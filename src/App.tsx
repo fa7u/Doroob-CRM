@@ -245,9 +245,14 @@ export default function App() {
         checkAiHealth();
       } else {
         const errorData = await res.json().catch(() => ({}));
+        let errMsg = errorData.error || res.statusText || 'خطأ غير معروف';
+        if (errorData.details) {
+          console.error("Server error details:", errorData.details);
+          errMsg += ` (التفاصيل: ${String(errorData.details).substring(0, 50)}...)`;
+        }
         setStatus({ 
           type: 'error', 
-          message: `فشل حفظ الإعدادات: ${errorData.error || res.statusText || 'خطأ غير معروف'}` 
+          message: `فشل حفظ الإعدادات: ${errMsg}` 
         });
       }
     } catch (e: any) {

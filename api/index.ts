@@ -18,29 +18,7 @@ const __dirname = path.dirname(__filename);
 
 // Use multiple strategies to find the config file
 const getFirebaseConfig = () => {
-    console.log(`[Firebase] __dirname: ${__dirname}`);
-    console.log(`[Firebase] process.cwd(): ${process.cwd()}`);
-    
-    // Check if we are running in Vercel environment where the file might be in the root of the function
-    const localConfig = path.join(__dirname, 'firebase-applet-config.json');
-    if (fs.existsSync(localConfig)) {
-        console.log(`[Firebase] Found config in local __dirname: ${localConfig}`);
-        return JSON.parse(fs.readFileSync(localConfig, 'utf8'));
-    }
-
-    const paths = [
-        path.join(process.cwd(), 'firebase-applet-config.json'),
-        path.join(__dirname, '../firebase-applet-config.json'),
-        path.join(process.cwd(), 'api', 'firebase-applet-config.json')
-    ];
-    for (const p of paths) {
-        if (fs.existsSync(p)) {
-            console.log(`[Firebase] Config found at: ${p}`);
-            return JSON.parse(fs.readFileSync(p, 'utf8'));
-        }
-    }
-    
-    // Check environment variable as fallback
+    // Check environment variable as FIRST priority on Vercel
     if (process.env.FIREBASE_CONFIG_JSON) {
         try {
             console.log(`[Firebase] Using config from FIREBASE_CONFIG_JSON env var`);
@@ -48,9 +26,27 @@ const getFirebaseConfig = () => {
         } catch (e) {}
     }
 
-    console.error("[Firebase] Config file NOT found in known paths.");
-    // Return empty config to avoid crash, but initialization will likely fail
-    return { projectId: process.env.GOOGLE_CLOUD_PROJECT || "fallback-project" };
+    const paths = [
+        path.join(process.cwd(), 'firebase-applet-config.json'),
+        path.join(__dirname, 'firebase-applet-config.json'),
+        path.join(__dirname, '..', 'firebase-applet-config.json'),
+        path.join(process.cwd(), 'api', 'firebase-applet-config.json'),
+        '/var/task/firebase-applet-config.json', // some vercel structures
+        '/var/task/api/firebase-applet-config.json'
+    ];
+    for (const p of paths) {
+        try {
+            if (fs.existsSync(p)) {
+                console.log(`[Firebase] Config found at: ${p}`);
+                return JSON.parse(fs.readFileSync(p, 'utf8'));
+            }
+        } catch (e) {}
+    }
+    
+    return { 
+        projectId: process.env.GOOGLE_CLOUD_PROJECT || process.env.VERCEL_GIT_REPO_SLUG || "fallback-project",
+        apiKey: process.env.FIREBASE_API_KEY || ""
+    };
 };
 
 const firebaseConfig = getFirebaseConfig();
@@ -74,10 +70,20 @@ if (getApps().length === 0) {
 }
 
 // Initialize Firebase Client SDK
-const clientApp = initializeClientApp(firebaseConfig);
-const clientDb = initializeFirestore(clientApp, {
-  experimentalForceLongPolling: true
-}, firebaseConfig.firestoreDatabaseId || "(default)");
+let clientDb: any;
+function getClientDb() {
+  if (clientDb) return clientDb;
+  try {
+    const clientApp = initializeClientApp(firebaseConfig);
+    clientDb = initializeFirestore(clientApp, {
+      experimentalForceLongPolling: true
+    }, firebaseConfig.firestoreDatabaseId || "(default)");
+    return clientDb;
+  } catch (e) {
+    console.error("[Firebase] Client SDK initialization failed:", e);
+    return null;
+  }
+}
 
 const app = express();
 
@@ -215,8 +221,11 @@ const getSettings = async () => {
 
     if (!firestoreData) {
       try {
-        const snap = await clientGetDoc(clientDoc(clientDb, SETTINGS_COL, GLOBAL_SETTINGS_ID));
-        if (snap.exists()) firestoreData = snap.data();
+        const cdb = getClientDb();
+        if (cdb) {
+          const snap = await clientGetDoc(clientDoc(cdb, SETTINGS_COL, GLOBAL_SETTINGS_ID));
+          if (snap.exists()) firestoreData = snap.data();
+        }
       } catch (e: any) {}
     }
 
@@ -243,14 +252,21 @@ const saveSettings = async (data: any) => {
           console.error("[Firestore] Admin saveSettings error:", adminErr.message);
         }
       }
-      await clientSetDoc(clientDoc(clientDb, SETTINGS_COL, GLOBAL_SETTINGS_ID), data, { merge: true });
-      return { type: 'client', success: true };
+      const cdb = getClientDb();
+      if (cdb) {
+        await clientSetDoc(clientDoc(cdb, SETTINGS_COL, GLOBAL_SETTINGS_ID), data, { merge: true });
+        return { type: 'client', success: true };
+      }
+      throw new Error("No database connection available (Both Admin and Client failed)");
     } catch (e: any) {
       console.error("[Firestore] Save error:", e.message);
       if (isStorageError(e)) {
         try {
-          await clientSetDoc(clientDoc(clientDb, SETTINGS_COL, GLOBAL_SETTINGS_ID), data, { merge: true });
-          return { type: 'client', success: true };
+          const cdb = getClientDb();
+          if (cdb) {
+            await clientSetDoc(clientDoc(cdb, SETTINGS_COL, GLOBAL_SETTINGS_ID), data, { merge: true });
+            return { type: 'client', success: true };
+          }
         } catch (inner) {
           memDb.settings.set(GLOBAL_SETTINGS_ID, data);
           return { type: 'memory', success: true };
@@ -267,8 +283,12 @@ const getInvitation = async (id: string) => {
         const invDoc = await db.collection(INV_COL).doc(id).get();
         if (invDoc.exists) return invDoc.data();
       }
-      const snap = await clientGetDoc(clientDoc(clientDb, INV_COL, id));
-      return snap.exists() ? snap.data() : memDb.invitations.get(id) || null;
+      const cdb = getClientDb();
+      if (cdb) {
+        const snap = await clientGetDoc(clientDoc(cdb, INV_COL, id));
+        return snap.exists() ? snap.data() : memDb.invitations.get(id) || null;
+      }
+      return memDb.invitations.get(id) || null;
     } catch (e: any) {
       return memDb.invitations.get(id) || null;
     }
@@ -281,10 +301,16 @@ const saveInvitation = async (id: string, data: any) => {
         await db.collection(INV_COL).doc(id).set(data, { merge: true });
         return;
       }
-      await clientSetDoc(clientDoc(clientDb, INV_COL, id), data, { merge: true });
+      const cdb = getClientDb();
+      if (cdb) {
+        await clientSetDoc(clientDoc(cdb, INV_COL, id), data, { merge: true });
+      } else {
+        throw new Error("No DB");
+      }
     } catch (e: any) {
       try {
-        await clientSetDoc(clientDoc(clientDb, INV_COL, id), data, { merge: true });
+        const cdb = getClientDb();
+        if (cdb) await clientSetDoc(clientDoc(cdb, INV_COL, id), data, { merge: true });
       } catch (inner) {
         memDb.invitations.set(id, { ...memDb.invitations.get(id), ...data });
       }
@@ -298,7 +324,8 @@ const deleteInvitation = async (id: string) => {
       if (db) {
         try { await db.collection(INV_COL).doc(id).delete(); return; } catch (e: any) {}
       }
-      await clientDeleteDoc(clientDoc(clientDb, INV_COL, id));
+      const cdb = getClientDb();
+      if (cdb) await clientDeleteDoc(clientDoc(cdb, INV_COL, id));
     } catch (e: any) {}
 };
 
@@ -311,8 +338,12 @@ const getAllInvitations = async () => {
           return snapshot.docs.map((d: any) => ({ id: d.id, ...d.data() }));
         } catch (e) { if (!isStorageError(e)) throw e; }
       }
-      const snap = await clientGetDocs(clientCollection(clientDb, INV_COL));
-      return snap.docs.map(d => ({ id: d.id, ...d.data() }));
+      const cdb = getClientDb();
+      if (cdb) {
+        const snap = await clientGetDocs(clientCollection(cdb, INV_COL));
+        return snap.docs.map(d => ({ id: d.id, ...d.data() }));
+      }
+      return Array.from(memDb.invitations.values());
     } catch (e) {
       return Array.from(memDb.invitations.values());
     }
@@ -327,8 +358,12 @@ const getAllArchives = async () => {
           return snapshot.docs.map((d: any) => ({ id: d.id, ...d.data() }));
         } catch (e) { if (!isStorageError(e)) throw e; }
       }
-      const snap = await clientGetDocs(clientCollection(clientDb, ARCHIVE_COL));
-      return snap.docs.map(d => ({ id: d.id, ...d.data() }));
+      const cdb = getClientDb();
+      if (cdb) {
+        const snap = await clientGetDocs(clientCollection(cdb, ARCHIVE_COL));
+        return snap.docs.map(d => ({ id: d.id, ...d.data() }));
+      }
+      return Array.from(memDb.archives.values());
     } catch (e) {
       return Array.from(memDb.archives.values());
     }
@@ -340,7 +375,8 @@ const saveArchive = async (id: string, data: any) => {
       if (db) {
         try { await db.collection(ARCHIVE_COL).doc(id).set(data); return; } catch (e) {}
       }
-      await clientSetDoc(clientDoc(clientDb, ARCHIVE_COL, id), data);
+      const cdb = getClientDb();
+      if (cdb) await clientSetDoc(clientDoc(cdb, ARCHIVE_COL, id), data);
     } catch (e) { memDb.archives.set(id, data); }
 };
 
@@ -351,7 +387,8 @@ const deleteArchive = async (id: string) => {
       if (db) {
         try { await db.collection(ARCHIVE_COL).doc(id).delete(); return; } catch (e) {}
       }
-      await clientDeleteDoc(clientDoc(clientDb, ARCHIVE_COL, id));
+      const cdb = getClientDb();
+      if (cdb) await clientDeleteDoc(clientDoc(cdb, ARCHIVE_COL, id));
     } catch (e) {}
 };
 
@@ -421,15 +458,28 @@ app.get("/api/rsvp", async (req, res) => {
 });
 
 app.get("/api/settings", async (req, res) => {
-  const s = await getSettings();
-  res.json(s);
+  try {
+    const s = await getSettings();
+    res.json(s);
+  } catch (error: any) {
+    console.error("[API] getSettings route error:", error);
+    res.status(500).json({ error: error.message || "Failed to load settings" });
+  }
 });
 
 app.post("/api/settings", async (req, res) => {
-  const current = await getSettings();
-  const updated = { ...current, ...req.body };
-  const saveRes = await saveSettings(updated);
-  res.json({ success: true, ...saveRes });
+  try {
+    const current = await getSettings();
+    const updated = { ...current, ...req.body };
+    const saveRes = await saveSettings(updated);
+    res.json({ success: true, ...saveRes });
+  } catch (error: any) {
+    console.error("[API] saveSettings route error:", error);
+    res.status(500).json({ 
+      error: error.message || "Failed to save settings",
+      details: error.stack 
+    });
+  }
 });
 
 app.get("/api/invitations", async (req, res) => {
