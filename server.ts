@@ -19,14 +19,21 @@ dotenv.config();
 // Initialize Firebase Admin (Preferred for server-side)
 if (getApps().length === 0) {
   try {
-    initializeApp({
-      credential: applicationDefault(),
-      projectId: firebaseConfig.projectId || process.env.GOOGLE_CLOUD_PROJECT
-    });
-    console.log("[Firebase Admin] Initialized with applicationDefault");
-  } catch (e) {
-    console.warn("[Firebase Admin] applicationDefault failed, trying basic init:", e.message);
-    initializeApp({ projectId: firebaseConfig.projectId });
+    // On Vercel, applicationDefault() usually fails unless configured with GOOGLE_APPLICATION_CREDENTIALS
+    // We try to use projectId from config first
+    if (process.env.VERCEL === "1") {
+       console.log("[Firebase Admin] Running on Vercel, skipping applicationDefault due to known issues.");
+       initializeApp({ projectId: firebaseConfig.projectId });
+    } else {
+       initializeApp({
+         credential: applicationDefault(),
+         projectId: firebaseConfig.projectId || process.env.GOOGLE_CLOUD_PROJECT
+       });
+       console.log("[Firebase Admin] Initialized with applicationDefault");
+    }
+  } catch (e: any) {
+    console.warn("[Firebase Admin] Init failed, trying basic init:", e.message);
+    try { initializeApp({ projectId: firebaseConfig.projectId }); } catch (inner) {}
   }
 }
 
@@ -56,8 +63,11 @@ async function autoInit() {
      if (dbId && dbId !== "(default)") {
        try {
          const db = getFirestore(dbId);
-         // Heartbeat check
-         await db.collection("settings").limit(1).get();
+         // Heartbeat check with timeout
+         await Promise.race([
+           db.collection("settings").limit(1).get(),
+           new Promise((_, reject) => setTimeout(() => reject(new Error("Timeout")), 2000))
+         ]);
          firestore = db;
          console.log(`[Firestore Admin SDK] SUCCESS: Using Configured DB "${dbId}"`);
          return;
@@ -69,8 +79,11 @@ async function autoInit() {
      // 2. Try Default instance (no args)
      try {
        const db = getFirestore();
-       // Heartbeat check
-       await db.collection("settings").limit(1).get();
+       // Heartbeat check with timeout
+       await Promise.race([
+         db.collection("settings").limit(1).get(),
+         new Promise((_, reject) => setTimeout(() => reject(new Error("Timeout")), 2000))
+       ]);
        firestore = db;
        console.log(`[Firestore Admin SDK] SUCCESS: Using Default DB`);
        return;
@@ -140,9 +153,9 @@ async function startServer() {
       return url;
     }
 
-    // 3. Fallback based on your provided environment metadata if possible, 
-    // but we'll use a dynamic detection as fallback
-    return 'https://ais-dev-x27yhjnpefte6r5jvr2jwi-286785108129.europe-west2.run.app'; 
+    // 3. Fallback based on environment if detection fails
+    const aisUrl = 'https://ais-dev-x27yhjnpefte6r5jvr2jwi-286785108129.europe-west2.run.app';
+    return process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : aisUrl;
   };
 
   const getSettings = async () => {
@@ -1542,6 +1555,9 @@ async function startServer() {
   }
 }
 
-startServer();
+// Ensure the server starts but doesn't block the export
+startServer().catch(err => {
+  console.error("Critical error during server start:", err);
+});
 
 export default app;
