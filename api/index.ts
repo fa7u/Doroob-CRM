@@ -12,7 +12,7 @@ import { initializeApp, getApps, applicationDefault } from 'firebase-admin/app';
 import { getFirestore } from 'firebase-admin/firestore';
 import { initializeApp as initializeClientApp } from 'firebase/app';
 import { initializeFirestore, doc as clientDoc, setDoc as clientSetDoc, getDoc as clientGetDoc, collection as clientCollection, getDocs as clientGetDocs, deleteDoc as clientDeleteDoc } from 'firebase/firestore';
-import firebaseConfig from './firebase-applet-config.json' with { type: 'json' };
+import firebaseConfig from '../firebase-applet-config.json' with { type: 'json' };
 
 dotenv.config();
 
